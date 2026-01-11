@@ -24,399 +24,17 @@ import numpy as np
 import copy
 import os, time, csv
 DEBUG_QUICK_FILTER = True
-
+import simulation as sim  # 引入仿真模块
+import utils as ut # 工具模块
 # 数据读入：强制依赖 data_io_1322.py（不再提供单文件兜底，避免掩盖 import 错误）
 from data_io_1322 import read_data, Data, recompute_cost_and_nearest_base
+# 引入拆分出去的可视化模块
+from viz_utils import visualize_truck_drone, compute_global_xlim_ylim, _normalize_decisions_for_viz
+from utils import (set_seed, _derive_promise_nodes_path, _is_promise_nodes_file,
+    freeze_existing_promise_windows_inplace, apply_promise_windows_inplace,
+    write_promise_nodes_csv, load_events_csv, group_events_by_time,
+    map_event_class_to_reloc_type, save_decision_log, print_tw_stats, compute_eta_map, _total_late_against_due, emit_scene_late_logs)
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-
-
-# =========================
-# 冻结承诺时间窗（Promise Window）与迟到统计
-# =========================
-def _derive_promise_nodes_path(in_nodes_csv: str) -> str:
-    """中文注释：nodes_xxx.csv -> nodes_xxx_promise.csv（不覆盖原文件）。若已是 *_promise.csv 则原样返回。"""
-    p = str(in_nodes_csv)
-    pl = p.lower()
-    if pl.endswith("_promise.csv"):
-        return p
-    if pl.endswith(".csv"):
-        return p[:-4] + "_promise.csv"
-    return p + "_promise.csv"
-
-def _is_promise_nodes_file(nodes_path: str) -> bool:
-    """中文注释：判断输入 nodes 文件是否已经是冻结承诺窗版本（*_promise.csv）。"""
-    try:
-        return str(nodes_path).lower().endswith("_promise.csv")
-    except Exception:
-        return False
-
-
-def freeze_existing_promise_windows_inplace(data):
-    """中文注释：
-    若输入本身就是 *_promise.csv，则认为 READY_TIME/DUE_TIME 已是冻结的承诺窗（PROM_READY/PROM_DUE）。
-    这里仅做字段初始化，确保后续事件处理与日志统计能读到 prom_ready/prom_due/effective_due。
-    """
-    for n in getattr(data, "nodes", []):
-        if str(n.get("node_type", "")).lower() != "customer":
-            continue
-        try:
-            pr = float(n.get("ready_time", 0.0))
-        except Exception:
-            pr = 0.0
-        try:
-            pd = float(n.get("due_time", 0.0))
-        except Exception:
-            pd = pr
-        n["prom_ready"] = pr
-        n["prom_due"] = pd
-        n["effective_due"] = pd
-        # 中文注释：求解端后续一律用当前 due_time 作为“有效截止时间”
-        n["due_time"] = pd
-
-def compute_eta_map(data, full_route, full_b2d, full_eval, *, drone_speed=None):
-    """中文注释：计算每个客户的 ETA（truck=到达/服务时刻；drone=单程到达客户时刻）。"""
-    if drone_speed is None:
-        drone_speed = DRONE_SPEED_UNITS
-    eta = {}
-    # truck 客户
-    arr = full_eval.get("arrival", {}) or {}
-    for idx in full_route:
-        if 0 <= int(idx) < len(data.nodes) and str(data.nodes[int(idx)].get("node_type","")).lower() == "customer":
-            eta[int(idx)] = float(arr.get(int(idx), 0.0))
-    # drone 客户
-    dep = full_eval.get("depart", {}) or {}
-    for b, cs in (full_b2d or {}).items():
-        for c in cs:
-            try:
-                c = int(c); b = int(b)
-            except Exception:
-                continue
-            if not (0 <= c < len(data.nodes) and 0 <= b < len(data.nodes)):
-                continue
-            d_bc = float(data.costMatrix[b, c])
-            eta[c] = float(dep.get(c, 0.0)) + d_bc / float(drone_speed)
-    return eta
-
-def apply_promise_windows_inplace(data, eta_map: dict, promise_width_h: float = 0.5):
-    """中文注释：将 PROM_READY/PROM_DUE 写入节点，并冻结为后续场景默认时间窗；同时把 due_time 置为有效截止时间。"""
-    for i, n in enumerate(data.nodes):
-        if str(n.get("node_type","")).lower() != "customer":
-            continue
-        if i not in eta_map:
-            # 中文注释：极端情况下可能未被分配；兜底用现有 ready/due
-            pr = float(n.get("ready_time", 0.0))
-        else:
-            pr = float(eta_map[i])
-        pd = pr + float(promise_width_h)
-        n["prom_ready"] = pr
-        n["prom_due"] = pd
-        n["effective_due"] = pd
-        # 中文注释：为了让现有 evaluate_full_system/ALNS 直接使用“冻结窗”，此处把 ready/due 写回 ready_time/due_time
-        n["ready_time"] = pr
-        n["due_time"] = pd
-
-def write_promise_nodes_csv(in_nodes_csv: str, out_nodes_csv: str, eta_map: dict, promise_width_h: float = 0.5):
-    """中文注释：输出 nodes_*_promise.csv，不覆盖原始数据集。"""
-    if (out_nodes_csv is None) or (str(out_nodes_csv).strip() == ""):
-        return
-    os.makedirs(os.path.dirname(out_nodes_csv) or ".", exist_ok=True)
-    with open(in_nodes_csv, "r", encoding="utf-8-sig", newline="") as f:
-        r = csv.DictReader(f)
-        fieldnames = list(r.fieldnames or [])
-        # 确保 PROM_* 列存在
-        if "PROM_READY" not in fieldnames:
-            fieldnames.append("PROM_READY")
-        if "PROM_DUE" not in fieldnames:
-            fieldnames.append("PROM_DUE")
-        rows = []
-        for row in r:
-            rows.append(row)
-    with open(out_nodes_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for row in rows:
-            ntype = str(row.get("NODE_TYPE","")).strip().lower()
-            try:
-                nid = int(float(row.get("NODE_ID", -1)))
-            except Exception:
-                nid = -1
-            if ntype == "customer" and nid in eta_map:
-                pr = float(eta_map[nid])
-                pd = pr + float(promise_width_h)
-                row["READY_TIME"] = f"{pr:.3f}"
-                row["DUE_TIME"] = f"{pd:.3f}"
-                row["PROM_READY"] = f"{pr:.3f}"
-                row["PROM_DUE"] = f"{pd:.3f}"
-            w.writerow(row)
-
-def _total_late_against_due(data, full_route, full_b2d, full_eval, *, due_mode: str = "prom", drone_speed=None):
-    """中文注释：计算 total_late（truck+drone），用于 late_prom 与 late_eff 对比。
-    due_mode='prom' -> 使用节点 prom_due（若缺失回退 due_time）
-    due_mode='eff'  -> 使用节点 due_time（即当前有效截止时间）
-    """
-    if drone_speed is None:
-        drone_speed = DRONE_SPEED_UNITS
-    arr = full_eval.get("arrival", {}) or {}
-    dep = full_eval.get("depart", {}) or {}
-    total = 0.0
-
-    def _get_due(c):
-        n = data.nodes[c]
-        if due_mode == "prom":
-            return float(n.get("prom_due", n.get("due_time", float("inf"))))
-        return float(n.get("due_time", float("inf")))
-
-    # truck
-    for idx in full_route:
-        if 0 <= int(idx) < len(data.nodes) and str(data.nodes[int(idx)].get("node_type","")).lower() == "customer":
-            c = int(idx)
-            eta = float(arr.get(c, 0.0))
-            due = _get_due(c)
-            if eta > due:
-                total += (eta - due)
-    # drone
-    for b, cs in (full_b2d or {}).items():
-        for c in cs:
-            try:
-                c = int(c); b = int(b)
-            except Exception:
-                continue
-            if not (0 <= c < len(data.nodes) and 0 <= b < len(data.nodes)):
-                continue
-            eta = float(dep.get(c, 0.0)) + float(data.costMatrix[b, c]) / float(drone_speed)
-            due = _get_due(c)
-            if eta > due:
-                total += (eta - due)
-    return float(total)
-
-def emit_scene_late_logs(out_dir: str, scene_idx: int, decision_time: float, data, full_route, full_b2d, full_eval, *, drone_speed=None, prefix: str = ""):
-    """中文注释：每个场景输出 late_prom / late_eff 汇总与明细 CSV（便于后续确定硬拒绝/软惩罚策略）。"""
-    if drone_speed is None:
-        drone_speed = DRONE_SPEED_UNITS
-    late_prom = _total_late_against_due(data, full_route, full_b2d, full_eval, due_mode="prom", drone_speed=drone_speed)
-    late_eff = _total_late_against_due(data, full_route, full_b2d, full_eval, due_mode="eff", drone_speed=drone_speed)
-
-    # 汇总打印
-    n_cust = sum(1 for n in data.nodes if str(n.get("node_type","")).lower() == "customer")
-    print(f"[LATE-SCENE] scene={scene_idx} t={decision_time:.2f}h customers={n_cust} late_prom={late_prom:.3f} late_eff={late_eff:.3f}")
-
-    if (out_dir is None) or (str(out_dir).strip() == ""):
-        return {"late_prom": late_prom, "late_eff": late_eff}
-
-    os.makedirs(out_dir, exist_ok=True)
-    fn = f"{prefix}late_scene{scene_idx:02d}_t{decision_time:.2f}.csv".replace(":", "_")
-    out_csv = os.path.join(out_dir, fn)
-
-    arr = full_eval.get("arrival", {}) or {}
-    dep = full_eval.get("depart", {}) or {}
-    # build rows
-    rows = []
-    # truck customers
-    truck_set = set([int(i) for i in full_route if 0 <= int(i) < len(data.nodes) and str(data.nodes[int(i)].get("node_type","")).lower()=="customer"])
-    drone_set = set([int(c) for cs in (full_b2d or {}).values() for c in cs])
-    for i, n in enumerate(data.nodes):
-        if str(n.get("node_type","")).lower() != "customer":
-            continue
-        mode = "truck" if i in truck_set else ("drone" if i in drone_set else "uncovered")
-        if mode == "truck":
-            eta = float(arr.get(i, 0.0))
-        elif mode == "drone":
-            # find base
-            b_found = None
-            for b, cs in (full_b2d or {}).items():
-                if i in cs:
-                    b_found = int(b); break
-            if b_found is None:
-                eta = float(dep.get(i, 0.0))
-            else:
-                eta = float(dep.get(i, 0.0)) + float(data.costMatrix[b_found, i]) / float(drone_speed)
-        else:
-            eta = float("nan")
-        prom_due = float(n.get("prom_due", float("nan")))
-        eff_due = float(n.get("due_time", float("nan")))
-        late_p = 0.0 if (math.isnan(eta) or math.isnan(prom_due)) else max(0.0, eta - prom_due)
-        late_e = 0.0 if (math.isnan(eta) or math.isnan(eff_due)) else max(0.0, eta - eff_due)
-        rows.append({
-            "IDX": i,
-            "NODE_ID": int(n.get("node_id", i)),
-            "MODE": mode,
-            "ETA_T": eta,
-            "PROM_DUE": prom_due,
-            "EFFECTIVE_DUE": eff_due,
-            "LATE_PROM": late_p,
-            "LATE_EFF": late_e,
-        })
-
-    with open(out_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    return {"late_prom": late_prom, "late_eff": late_eff, "csv": out_csv}
-
-# =========================
-# 在线扰动日志（可复现）
-# =========================
-def load_events_csv(path: str):
-    """读取 events.csv（仅事实，不含 accept/reject）。"""
-    events = []
-    if (path is None) or (str(path).strip() == ""):
-        return events
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            def _f(k, default=0.0):
-                try:
-                    return float(row.get(k, default))
-                except Exception:
-                    return float(default)
-            def _i(k, default=0):
-                try:
-                    return int(float(row.get(k, default)))
-                except Exception:
-                    return int(default)
-
-            ev = {
-                "EVENT_ID": _i("EVENT_ID", 0),
-                "EVENT_TIME": _f("EVENT_TIME", 0.0),
-                "NODE_ID": _i("NODE_ID", -1),
-                "NEW_X": _f("NEW_X", 0.0),
-                "NEW_Y": _f("NEW_Y", 0.0),
-                "EVENT_CLASS": str(row.get("EVENT_CLASS", "")).strip().upper(),
-                "DELTA_AVAIL_H": _f("DELTA_AVAIL_H", 0.0),
-            }
-            events.append(ev)
-    return events
-
-
-def group_events_by_time(events, ndigits: int = 6):
-    """按 EVENT_TIME 分组（key 使用 round(t, ndigits)）。"""
-    g = {}
-    for e in events:
-        t = round(float(e.get("EVENT_TIME", 0.0)), ndigits)
-        g.setdefault(t, []).append(e)
-    return g
-
-
-def map_event_class_to_reloc_type(event_class: str) -> str:
-    """将 events.csv 的 EVENT_CLASS 映射到求解端内部 reloc_type."""
-    s = str(event_class or "").strip().upper()
-    if s in ("IN_DB", "INTRA", "INTRA_DB"):
-        return "intra"
-    if s in ("CROSS_DB", "CROSS", "CROSSBASE", "CROSS_BASE"):
-        return "cross"
-    if s in ("OUT_DB", "OUT", "OUTSIDE"):
-        return "out"
-    # 默认：legacy（沿用旧逻辑）
-    return "legacy"
-
-
-def save_decision_log(rows, path: str):
-    """保存 decision_log.csv：事件决策日志（含承诺窗/有效窗与Δ指标）。"""
-    if (path is None) or (str(path).strip() == ""):
-        return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fields = [
-        "EVENT_ID", "EVENT_TIME", "NODE_ID",
-        "DECISION", "REASON",
-        "OLD_X", "OLD_Y", "NEW_X", "NEW_Y",
-        "EVENT_CLASS",
-        "APPLIED_X", "APPLIED_Y",
-        "FORCE_TRUCK", "BASE_LOCK",
-        "DELTA_AVAIL_H",
-        "PROM_READY", "PROM_DUE",
-        "EFFECTIVE_DUE",
-        "D_COST", "D_LATE_PROM", "D_LATE_EFF"
-
-    ]
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for r in rows:
-            # 兼容缺失字段
-            out = {k: r.get(k, "") for k in fields}
-            w.writerow(out)
-
-# ——中文字体自动选择（稳健版：候选列表 + available 集合 + chosen 默认值；仅在绘图时调用）——
-_CN_FONT_READY = False
-
-def _configure_matplotlib_cn_font():
-    """中文注释：设置 matplotlib 中文字体（惰性/一次性）。
-    - 仅在需要绘图时调用（避免 import 阶段扫描字体导致启动变慢）。
-    - 任何异常都吞掉，保证不影响求解主流程。
-    """
-    global _CN_FONT_READY
-    if _CN_FONT_READY:
-        return
-    try:
-        import matplotlib as mpl
-        from matplotlib import font_manager
-    except Exception:
-        _CN_FONT_READY = True
-        return
-
-    # 中文注释：常见中文字体候选（按优先级）
-    candidates = [
-        "Microsoft YaHei",      # Windows
-        "SimHei",               # Windows
-        "Noto Sans CJK SC",      # Linux/通用
-        "PingFang SC",           # macOS
-        "Arial Unicode MS",      # 旧版 macOS/Office
-        "DejaVu Sans",           # matplotlib 默认（兜底）
-    ]
-
-    try:
-        available = {f.name for f in font_manager.fontManager.ttflist}
-    except Exception:
-        available = set()
-
-    # 中文注释：若找不到任何候选字体，则使用默认 DejaVu Sans（保证不报错）
-    chosen = next((n for n in candidates if n in available), "DejaVu Sans")
-
-    try:
-        # matplotlib 可能在不同版本上对 font.family / font.sans-serif 的行为略有差异，这里同时设置更稳健
-        mpl.rcParams["font.sans-serif"] = [chosen]
-        mpl.rcParams["font.family"] = chosen
-        mpl.rcParams["axes.unicode_minus"] = False  # 负号正常显示
-    except Exception:
-        pass
-
-    _CN_FONT_READY = True
-
-TRUCK_SPEED_KMH = 30.0
-DRONE_SPEED_KMH = 60.0
-# 坐标单位换算：5 个坐标单位 = 1 km（因此：dist_km = dist_units / SCALE_KM_PER_UNIT）
-SCALE_KM_PER_UNIT = 5.0
-# 路况系数：卡车走道路绕行导致“等效距离/等效时间”放大（无人机仍按欧氏直线）
-TRUCK_ROAD_FACTOR = 1.5
-# 速度（坐标单位/小时）：卡车速度固定，不随路况系数变化（路况仅放大卡车弧距离）
-TRUCK_SPEED_UNITS = TRUCK_SPEED_KMH * SCALE_KM_PER_UNIT  # 中文注释：固定卡车速度（坐标单位/小时）
-
-
-def set_truck_road_factor(road_factor: float):
-    """
-    中文注释：统一的路况因子入口（唯一语义口径）。
-    - 卡车速度固定：TRUCK_SPEED_UNITS（不随 road_factor 变化）。
-    - road_factor 只放大卡车“弧距离”：truck_arc_cost = euclid_dist * TRUCK_ROAD_FACTOR。
-      因此卡车行驶时间也随之增大：travel_time = truck_arc_cost / TRUCK_SPEED_UNITS。
-    - 无人机仍按欧氏直线距离（data.costMatrix）计算。
-    """
-    global TRUCK_ROAD_FACTOR
-    TRUCK_ROAD_FACTOR = float(road_factor)
-    if TRUCK_ROAD_FACTOR <= 0:
-        raise ValueError(f'[PARAM] TRUCK_ROAD_FACTOR 必须 >0, got {TRUCK_ROAD_FACTOR}')
-    # 中文注释：速度固定，不在此处改写；路况影响由 truck_arc_cost 统一生效
-
-DRONE_SPEED_UNITS = DRONE_SPEED_KMH * SCALE_KM_PER_UNIT
-DRONE_RANGE_KM = 10.0
-DRONE_RANGE_UNITS = DRONE_RANGE_KM * SCALE_KM_PER_UNIT  # 单位：坐标单位
-DRONE_SINGLE_RANGE_UNITS = DRONE_RANGE_UNITS/2
-DRONE_CAPACITY = 2.0  # kg（或你定 2.3）
-
-NUM_DRONES_PER_BASE = 999       # 每个基站配置 3 架无人机
 # ========= 数据集 Schema（节点 + 动态事件）=========
 # 说明：nodes.csv 仅包含静态节点字段；动态请求流由 events.csv 单独给出（EVENT_TIME, NODE_ID, NEW_X, NEW_Y, EVENT_CLASS）。
 CSV_REQUIRED_COLS = [
@@ -456,19 +74,6 @@ CFG_D = {
     "REPAIRS":  ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone", "R_late_repair_reinsert", "R_base_feasible_drone_first"],
 }
 
-
-
-def truck_arc_cost(data: Data, i: int, j: int) -> float:
-    """中文注释：卡车弧距离（用于道路绕行/路况），统一口径。
-
-    你的语义：卡车速度固定（30km/h），但实际道路行驶距离 = 欧氏直线距离 × TRUCK_ROAD_FACTOR。
-    因此：
-      - 卡车距离（用于成本/日志/ALNS 搜索）应使用本函数；
-      - 卡车行驶时间 = truck_arc_cost / TRUCK_SPEED_UNITS；
-      - 无人机仍使用欧氏距离（data.costMatrix）。
-    """
-    return float(data.costMatrix[i, j]) * float(TRUCK_ROAD_FACTOR)
-
 def dprint(*args, **kwargs):
     """统一的调试打印开关，避免到处散落 print"""
     if DEBUG:
@@ -477,76 +82,6 @@ def dprint(*args, **kwargs):
 # ==============
 # 一些基础函数
 # ==============
-def classify_clients_for_drone(data, allowed_customers=None, feasible_bases=None):
-    """
-    按“距最近基站的距离”把客户分为：
-      - truck_customers: 必须由卡车服务（含 force_truck=1）
-      - base_to_drone_customers: dict[base_idx] = [client_idx1, ...]
-
-    allowed_customers:
-      - 为 None 时：默认所有 customer 节点都参与分类（静态场景）
-      - 为一个集合 / 列表 时：只对这些客户做分类（动态场景只重规划未服务客户）
-
-    重要：若客户带有 base_lock（例如候选 E：换基站），则优先使用锁定基站做无人机覆盖判定与分配。
-    """
-
-    base_indices = [i for i, n in enumerate(data.nodes) if n['node_type'] == 'base']
-    if feasible_bases is not None:
-        feasible_set = set(int(b) for b in feasible_bases)
-        base_indices = [b for b in base_indices if b in feasible_set]
-
-    # 中心仓库也作为一个基站
-    central_idx = data.central_idx
-    if central_idx not in base_indices:
-        base_indices.append(central_idx)
-
-    # 所有客户索引
-    customer_indices = [i for i, n in enumerate(data.nodes) if n['node_type'] == 'customer']
-
-    # 如果传入了 allowed_customers，只保留其中的客户
-    if allowed_customers is not None:
-        allowed_set = set(allowed_customers)
-        customer_indices = [c for c in customer_indices if c in allowed_set]
-
-    base_to_drone_customers = {b: [] for b in base_indices}
-    truck_customers = []
-
-    for c in customer_indices:
-        node_c = data.nodes[c]
-
-        # 1) force_truck：无条件卡车
-        if node_c.get('force_truck', 0) == 1:
-            truck_customers.append(c)
-            continue
-
-        # 2) base_lock：优先锁定基站（如果仍在可选基站集合里）
-        b_lock = node_c.get('base_lock', None)
-        if b_lock is not None:
-            try:
-                b_lock = int(b_lock)
-            except Exception:
-                b_lock = None
-        if b_lock is not None and b_lock in base_indices:
-            best_base = b_lock
-            best_dist = float(data.costMatrix[best_base, c])
-        else:
-            # 3) 正常：找最近基站
-            best_base = None
-            best_dist = float('inf')
-            for b in base_indices:
-                d = float(data.costMatrix[b, c])
-                if d < best_dist:
-                    best_dist = d
-                    best_base = b
-
-        # 往返距离 = 2 * best_dist
-        if best_base is not None and 2.0 * best_dist <= DRONE_RANGE_UNITS:
-            base_to_drone_customers[best_base].append(c)
-        else:
-            truck_customers.append(c)
-
-    return base_to_drone_customers, truck_customers
-
 def relax_drone_time_windows(data: Data,
                              base_to_drone_customers,
                              extra_slack: float = 2.0,
@@ -585,7 +120,7 @@ def enforce_force_truck_solution(data, route, b2d):
     def extra_cost_insert(r, node_idx, pos):
         a = r[pos - 1]
         b = r[pos]
-        return truck_arc_cost(data, a, node_idx) + truck_arc_cost(data, node_idx, b) - truck_arc_cost(data, a, b)
+        return sim.truck_arc_cost(data, a, node_idx) + sim.truck_arc_cost(data, node_idx, b) - sim.truck_arc_cost(data, a, b)
 
     # 若路径长度不足（异常情况），直接拼接
     if len(route) < 2:
@@ -605,151 +140,7 @@ def enforce_force_truck_solution(data, route, b2d):
 
     return route, b2d
 
-def check_disjoint(data: Data, route, base_to_drone_customers):
-    """
-    检查：卡车客户集合 与 无人机客户集合 是否互斥。
-    调试时可以在迭代结束后调用一次。
-    """
-    route_customers = {i for i in route if data.nodes[i]['node_type'] == 'customer'}
-
-    drone_customers = set()
-    for _, lst in base_to_drone_customers.items():
-        for c in lst:
-            drone_customers.add(c)
-
-    inter = route_customers & drone_customers
-    if inter:
-        print("警告：以下客户同时出现在卡车路径和无人机列表中：",
-              [data.nodes[i]['node_id'] for i in inter])
-    else:
-        dprint("检查通过：卡车客户与无人机客户集合互斥。")  # 仅调试时输出
-
-def compute_truck_schedule(data: Data,
-                           route,
-                           start_time: float = 0.0,
-                           speed: float = None):
-    """
-    计算卡车在各节点的到达时间和总行驶时间（小时）。
-    约定：
-    - route[0] 是中心仓库
-    - 不把“回到中心”的时间写进 arrival_times，只作为 total_time 返回
-    """
-    if speed is None:
-        speed = TRUCK_SPEED_UNITS
-    arrival_times = {}
-    current_time = start_time
-
-    # 起点：中心仓库，到达时间 = start_time
-    start_idx = route[0]
-    arrival_times[start_idx] = current_time
-
-    prev = start_idx
-
-    # 从 route[1] 到 route[-1] 依次走，但只对中间节点记录 arrival
-    for pos in range(1, len(route)):
-        curr = route[pos]
-        travel_time = truck_arc_cost(data, prev, curr) / speed
-        current_time += travel_time
-
-        # 只有非起点、非终点的节点记录到达时间
-        if pos < len(route) - 1:
-            arrival_times[curr] = current_time
-
-        prev = curr
-
-    total_time = current_time
-
-    # 计算迟到：只针对 customer 节点（central/base 不应计入时间窗惩罚）
-    total_late = 0.0
-    for idx, node in enumerate(data.nodes):
-        if idx not in arrival_times:
-            continue
-        nt = str(node.get('node_type', '')).strip().lower()
-        is_customer = (nt == 'customer') or (nt == 'c') or ('cust' in nt)
-        if not is_customer:
-            continue
-        arr = float(arrival_times[idx])
-        due = float(node.get('due_time', float('inf')))
-        if arr > due:
-            total_late += (arr - due)
-
-    return arrival_times, total_time, total_late
-
-def guardrail_check(data, full_route, full_b2d, tag=""):
-    """
-    工程护栏：任何场景、任何阶段都必须满足的硬性不变量
-    出错就立刻抛异常，防止“悄悄丢点/重复/force_truck被无人机拿走”。
-    """
-    # 1) customer 集合
-    all_customers = {i for i, n in enumerate(data.nodes) if n.get("node_type") == "customer"}
-
-    # 2) 路径上的 customer
-    truck_customers = {i for i in full_route
-                       if 0 <= i < len(data.nodes) and data.nodes[i].get("node_type") == "customer"}
-
-    # 3) 无人机上的 customer
-    drone_customers = {c for cs in full_b2d.values() for c in cs}
-
-    # 4) 覆盖性：不能丢客户
-    covered = truck_customers | drone_customers
-    uncovered = all_customers - covered
-    if uncovered:
-        nids = [data.nodes[i]["node_id"] for i in sorted(uncovered)]
-        raise RuntimeError(f"[GUARDRAIL]{tag} 存在未覆盖客户 uncovered={len(uncovered)} node_id={nids}")
-
-    # 5) 互斥性：卡车与无人机不能重复服务
-    inter = truck_customers & drone_customers
-    if inter:
-        nids = [data.nodes[i]["node_id"] for i in sorted(inter)]
-        raise RuntimeError(f"[GUARDRAIL]{tag} 卡车/无人机重复服务客户 inter={len(inter)} node_id={nids}")
-
-    # 6) force_truck 必须在卡车路径中，且不允许出现在无人机任务里
-    forced = {i for i in all_customers if data.nodes[i].get("force_truck", 0) == 1}
-    bad_in_drone = forced & drone_customers
-    if bad_in_drone:
-        nids = [data.nodes[i]["node_id"] for i in sorted(bad_in_drone)]
-        raise RuntimeError(f"[GUARDRAIL]{tag} force_truck 出现在无人机任务里 node_id={nids}")
-
-    missing_in_truck = forced - truck_customers
-    if missing_in_truck:
-        nids = [data.nodes[i]["node_id"] for i in sorted(missing_in_truck)]
-        raise RuntimeError(f"[GUARDRAIL]{tag} force_truck 没进入卡车路径 node_id={nids}")
-
-    # 7) 坐标有效性：不能 NaN / None（这是你“丢坐标”的最早报警点）
-    for i in all_customers:
-        x, y = data.nodes[i].get("x"), data.nodes[i].get("y")
-        if x is None or y is None or (isinstance(x, float) and math.isnan(x)) or (isinstance(y, float) and math.isnan(y)):
-            raise RuntimeError(f"[GUARDRAIL]{tag} 客户坐标无效 node_id={data.nodes[i]['node_id']} x={x} y={y}")
-
-def sanity_check_full(data, full_route, full_b2d):
-    """一致性检查：去重、互斥、覆盖数不超总客户数（服务时间忽略）"""
-    all_customers = {i for i, n in enumerate(data.nodes) if n.get('node_type') == 'customer'}
-
-    truck_set = {i for i in full_route if i in all_customers}
-    drone_list = [c for cs in full_b2d.values() for c in cs]
-    drone_set = set(drone_list)
-
-    if len(drone_list) != len(drone_set):
-        raise RuntimeError(f"[FULL-check] drone 列表有重复：len={len(drone_list)} uniq={len(drone_set)}")
-
-    inter = truck_set & drone_set
-    if inter:
-        raise RuntimeError(f"[FULL-check] truck/drone 客户冲突：{sorted(inter)}")
-
-    covered = truck_set | drone_set
-    if len(covered) > len(all_customers):
-        raise RuntimeError(f"[FULL-check] 覆盖数超过客户总数：covered={len(covered)} total={len(all_customers)}")
-
-    return {
-        "n_customers": len(all_customers),
-        "truck_customers": len(truck_set),
-        "drone_customers": len(drone_set),
-        "covered": len(covered),
-        "uncovered": len(all_customers - covered),
-    }
-
-
-def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=DRONE_RANGE_UNITS):
+def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None):
     """返回客户 cid 在当前上下文下可用的基站集合。
 
     语义区分：
@@ -761,6 +152,8 @@ def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=DRONE_RAN
     - 覆盖：2*d(base, client) <= drone_range
     - 供货：基站要么已访问（visited_bases），要么在后缀路线中会访问（route_set）
     """
+    if drone_range is None:
+        drone_range = sim.DRONE_RANGE_UNITS  # 从 sim 获取最新值
     feas_pool = ctx.get('feasible_bases_for_drone', None)
     if feas_pool is None:
         feas_pool = ctx.get('bases_to_visit', [])
@@ -790,11 +183,11 @@ def drone_repair_feasible(data, route, b2d, ctx, k_moves=5, sample_k=12):
     每一步用 evaluate_truck_drone_with_time 真实评估 cost，确保“扎实可靠”。
     """
     bases_to_visit = ctx.get("bases_to_visit", [])
-    drone_range = ctx.get("drone_range", DRONE_RANGE_UNITS)
+    drone_range = ctx.get("drone_range", sim.DRONE_RANGE_UNITS)
     alpha_drone = ctx.get("alpha_drone", 0.3)
     lambda_late = ctx.get("lambda_late", 50.0)
-    truck_speed = ctx.get("truck_speed", TRUCK_SPEED_UNITS)
-    drone_speed = ctx.get("drone_speed", DRONE_SPEED_UNITS)
+    truck_speed = ctx.get("truck_speed", sim.TRUCK_SPEED_UNITS)
+    drone_speed = ctx.get("drone_speed", sim.DRONE_SPEED_UNITS)
     start_time = ctx.get("start_time", 0.0)
 
     route_set = set(route)
@@ -807,7 +200,7 @@ def drone_repair_feasible(data, route, b2d, ctx, k_moves=5, sample_k=12):
     candidates = list((in_route | in_drone) - force_truck_set)
 
     def eval_cost(r, bd):
-        return evaluate_truck_drone_with_time(
+        return sim.evaluate_truck_drone_with_time(
             data, r, bd,
             alpha_drone=alpha_drone, lambda_late=lambda_late,
             truck_speed=truck_speed, drone_speed=drone_speed,
@@ -899,64 +292,6 @@ def drone_repair_feasible(data, route, b2d, ctx, k_moves=5, sample_k=12):
         candidates = list((in_route | in_drone) - force_truck_set)
 
     return route, b2d
-
-def evaluate_full_system(data, full_route, full_b2d,
-                         alpha_drone=0.3, lambda_late=50.0,
-                         truck_speed=None, drone_speed=None):
-    """全系统口径：从 t=0 开始计算 cost / system_time / late（服务时间忽略）"""
-    if truck_speed is None:
-        truck_speed = TRUCK_SPEED_UNITS
-    if drone_speed is None:
-        drone_speed = DRONE_SPEED_UNITS
-    # 1) truck 距离
-    truck_dist = 0.0
-    for i in range(len(full_route) - 1):
-        truck_dist += truck_arc_cost(data, full_route[i], full_route[i + 1])
-
-    # 2) truck 时间与迟到（total_time 才是回仓完成时间）
-    arrival, total_time, truck_late = compute_truck_schedule(
-        data, full_route, start_time=0.0, speed=truck_speed
-    )
-
-    # 3) 多无人机调度（返回每个客户 depart/finish）
-    depart, finish, base_finish = compute_multi_drone_schedule(
-        data, full_b2d, arrival,
-        num_drones_per_base=NUM_DRONES_PER_BASE,
-        drone_speed=drone_speed
-    )
-
-    # 4) drone 距离 + drone 迟到（用 depart + 单程飞行到达时间比 due_time）
-    drone_dist = 0.0
-    drone_late = 0.0
-    for b, cs in full_b2d.items():
-        for c in cs:
-            d_bc = data.costMatrix[b, c]
-            drone_dist += 2.0 * d_bc
-            arrive_c = depart[c] + d_bc / drone_speed
-            due = data.nodes[c].get('due_time', float('inf'))
-            if arrive_c > due:
-                drone_late += (arrive_c - due)
-
-    total_late = truck_late + drone_late
-    system_time = max(total_time, max(base_finish.values()) if base_finish else 0.0)
-
-    # 关键：路况系数口径（无人机不变；卡车距离已在 truck_arc_cost 中放大，此处不再二次处理）
-    cost, truck_dist_eff = _compose_cost(truck_dist, drone_dist, total_late, alpha_drone, lambda_late)
-    return {
-        "cost": cost,
-        "system_time": system_time,
-        "truck_dist": truck_dist,
-        "truck_dist_eff": truck_dist_eff,
-        "drone_dist": drone_dist,
-        "truck_late": truck_late,
-        "drone_late": drone_late,
-        "total_late": total_late,
-        "arrival": arrival,
-        "depart": depart,
-        "finish": finish,
-        "base_finish": base_finish,
-        "truck_total_time": total_time,
-    }
 
 def pick_worst_late_truck_customer(data, route, full_eval, eps: float = 1e-9):
     """中文注释：从当前解里自动找出“卡车服务客户”中迟到最大的一个。
@@ -1109,7 +444,7 @@ def apply_relocations_for_decision_time(
                 bx = data_new.nodes[bidx]['x']
                 by = data_new.nodes[bidx]['y']
                 d = math.hypot(px - bx, py - by)
-                return (2.0 * d <= DRONE_RANGE_UNITS), d
+                return (2.0 * d <= sim.DRONE_RANGE_UNITS), d
 
             # 情况A：货已到旧基站 -> 只能同基站内变更（不允许换基站）
             if t_old_base <= decision_time + 1e-9:
@@ -1368,80 +703,6 @@ def add_virtual_truck_position_node(data, pos):
     data.costMatrix = new_mat
     return new_idx
 
-def compute_multi_drone_schedule(data: Data,
-                                 base_to_drone_customers,
-                                 arrival_times,
-                                 num_drones_per_base: int = NUM_DRONES_PER_BASE,
-                                 drone_speed: float = DRONE_SPEED_UNITS,
-                                 arrival_prefix: dict = None,
-                                 default_base_arrival: float = 0.0):
-    """多无人机调度（List Scheduling）。
-
-    关键修复：当 arrival_times 是“后缀时间表”（仅包含未来访问节点）时，
-    允许通过 arrival_prefix 提供“已访问基站”的到达时刻，避免 base_arrival=0 造成 late/cost 爆炸。
-
-    参数：
-    - arrival_times: 当前（可能是后缀）卡车到达时刻
-    - arrival_prefix: 已访问基站的到达时刻（全局时间轴）
-    - default_base_arrival: 若两者都缺失（理论上不应发生），使用该默认值兜底
-    """
-    depart_times = {}       # client_idx -> depart_time
-    finish_times = {}       # client_idx -> finish_time
-    base_finish_times = {}  # base_idx   -> finish_time
-
-    for base_idx, clients in base_to_drone_customers.items():
-        if not clients:
-            # 没有无人机客户的基站：完成时间就是“卡车到达基站时刻”
-            t_base = arrival_times.get(base_idx, None)
-            if t_base is None and arrival_prefix is not None:
-                t_base = arrival_prefix.get(base_idx, None)
-            if t_base is None:
-                t_base = float(default_base_arrival)
-            base_finish_times[base_idx] = float(t_base)
-            continue
-
-        # 卡车到达该基站的时间（优先后缀 arrival，其次 prefix）
-        base_arrival = arrival_times.get(base_idx, None)
-        if base_arrival is None and arrival_prefix is not None:
-            base_arrival = arrival_prefix.get(base_idx, None)
-        if base_arrival is None:
-            base_arrival = float(default_base_arrival)
-
-        # 初始化每架无人机的下一次可用时间
-        drone_available = [float(base_arrival)] * int(num_drones_per_base)
-
-        for c in clients:
-            k = min(range(int(num_drones_per_base)), key=lambda i: drone_available[i])
-            depart = float(drone_available[k])
-
-            d_bc = float(data.costMatrix[base_idx, c])
-            fly_time = 2.0 * d_bc / float(drone_speed)
-            finish = depart + fly_time
-
-            depart_times[c] = depart
-            finish_times[c] = finish
-            drone_available[k] = finish
-
-        base_finish_times[base_idx] = max(drone_available)
-
-    return depart_times, finish_times, base_finish_times
-
-def _compose_cost(truck_dist, drone_dist, total_late, alpha_drone, lambda_late):
-    """统一的成本合成口径。
-
-    重要约定（按你的最新需求统一）：
-    - 路况系数 TRUCK_ROAD_FACTOR 只影响卡车“弧距离”（欧氏距离×系数），从而进入卡车时间/迟到与卡车距离成本。
-    - 成本口径不在此处再二次放大卡车距离（truck_dist 已是“含路况”的卡车距离）。
-    - objective = truck_dist + alpha_drone*drone_dist + lambda_late*total_late
-    """
-    truck_dist = float(truck_dist)
-    drone_dist = float(drone_dist)
-    total_late = float(total_late)
-    total_cost = truck_dist + float(alpha_drone) * drone_dist + float(lambda_late) * total_late
-    # 保持字段兼容：truck_dist_eff 仍返回，但等同于 truck_dist（不再包含路况放大）
-    truck_dist_eff = truck_dist
-    return total_cost, truck_dist_eff
-
 def _pack_scene_record(scene_idx, t_dec, full_eval, num_req, num_acc, num_rej,
                        alpha_drone=0.3, lambda_late=50.0):
     """统一封装动态场景记录行，确保关键指标口径一致。"""
@@ -1475,22 +736,6 @@ def _decision_tag(decision_item):
     return ""
 
 
-def _normalize_decisions_for_viz(data_cur, decisions):
-    """把 decisions 规范成 visualize_truck_drone 需要的 8 元组列表。"""
-    out = []
-    for it in decisions:
-        if isinstance(it, (list, tuple)) and len(it) == 8:
-            out.append(it)
-        elif isinstance(it, (list, tuple)) and len(it) == 5:
-            c, dec, nx, ny, reason = it
-            c = int(c)
-            nid = data_cur.nodes[c]['node_id']
-            ox = data_cur.nodes[c]['x']
-            oy = data_cur.nodes[c]['y']
-            out.append((c, nid, dec, reason, ox, oy, nx, ny))
-        else:
-            dprint("[WARN] decisions 格式异常(跳过可视化标记):", it)
-    return out
 
 
 def _merge_prefix_suffix(prefix_route, suffix_route):
@@ -1502,124 +747,6 @@ def _merge_prefix_suffix(prefix_route, suffix_route):
     if prefix_route[-1] == suffix_route[0]:
         return prefix_route + suffix_route[1:]
     return prefix_route + suffix_route
-
-
-
-
-def evaluate_truck_drone_with_time(data, route, base_to_drone, start_time=0.0, truck_speed=None,
-                                  drone_speed=None, alpha_drone=0.3, lambda_late=50.0,
-                                  arrival_prefix: dict = None):
-    """粗粒度评估（用于 ALNS 内部快速比较）。
-
-    关键修复：当 route 为“后缀路线”时，arrival_times 只包含后缀节点；
-    对于已访问基站，其到达时刻需从 arrival_prefix（全局时间表）补齐，否则会把 base_arrival
-    错当成 start_time 或 0，进而引发 late/cost 异常。
-    """
-    if truck_speed is None:
-        truck_speed = TRUCK_SPEED_UNITS
-    if drone_speed is None:
-        drone_speed = DRONE_SPEED_UNITS
-    arrival_times, total_time, _ = compute_truck_schedule(data, route, start_time=start_time, speed=truck_speed)
-
-    # 路径上的卡车距离
-    truck_dist = 0.0
-    for i in range(len(route) - 1):
-        a, b = route[i], route[i + 1]
-        truck_dist += truck_arc_cost(data, a, b)
-
-    # 无人机距离 & 迟到（简单口径：base_arrival + 往返飞行时间）
-    drone_dist = 0.0
-    drone_late = 0.0
-    for base_idx, clients in base_to_drone.items():
-        # base 到达时刻：优先后缀 arrival，其次 prefix
-        base_arrival = arrival_times.get(base_idx, None)
-        if base_arrival is None and arrival_prefix is not None:
-            base_arrival = arrival_prefix.get(base_idx, None)
-        if base_arrival is None:
-            base_arrival = float(start_time)
-
-        for c in clients:
-            d = float(data.costMatrix[base_idx, c])
-            drone_dist += 2.0 * d
-            service_time = base_arrival + (2.0 * d / float(drone_speed))
-            due = float(data.nodes[c].get('due_time', float('inf')))
-            if service_time > due:
-                drone_late += (service_time - due)
-
-    # 卡车迟到：用 arrival_times
-    truck_late = 0.0
-    for idx in route:
-        if data.nodes[idx].get('node_type') == 'customer':
-            due = float(data.nodes[idx].get('due_time', float('inf')))
-            arr = float(arrival_times.get(idx, float('inf')))
-            if arr > due:
-                truck_late += (arr - due)
-
-    total_late = truck_late + drone_late
-    # 关键：卡车距离/成本按路况系数放大；无人机不变
-    total_cost, truck_dist_eff = _compose_cost(truck_dist, drone_dist, total_late, alpha_drone, lambda_late)
-
-    # 中文注释：保持与旧版接口兼容（很多地方按 7 个返回值解包）
-    # 返回：cost, truck_dist, drone_dist, truck_late, drone_late, total_late, truck_finish_time
-    return total_cost, truck_dist, drone_dist, truck_late, drone_late, total_late, total_time
-
-
-def lateness_stats_from_finish_times(data, finish_times, topk=5):
-    """
-    中文注释：根据 finish_times 与 ready/due 计算迟到统计（兼容大小写字段名）
-    finish_times: dict，键建议是 node_id（客户的 node_id）
-    """
-    nodes = getattr(data, "nodes", None)
-    if not nodes:
-        return {"sum": 0.0, "avg": 0.0, "max": 0.0, "n_late": 0, "n": 0, "top": [],
-                "n_customer": 0, "n_has_finish": 0}
-
-    def get_field(n, *keys, default=None):
-        for k in keys:
-            if k in n and n[k] is not None:
-                return n[k]
-        return default
-
-    late_list = []
-    n_customer = 0
-    n_has_finish = 0
-
-    for n in nodes:
-        nt = str(get_field(n, "node_type", "NODE_TYPE", "type", "TYPE", default="")).strip().lower()
-        is_customer = (nt == "customer") or (nt == "c") or ("cust" in nt)
-        if not is_customer:
-            continue
-
-        n_customer += 1
-        cid = int(get_field(n, "node_id", "NODE_ID", default=-1))
-
-        due = float(get_field(n, "due_time", "DUE_TIME", "due", "DUE", default=0.0))
-
-        fin = finish_times.get(cid, None)
-        if fin is None:
-            # 保险：有些实现会用字符串 key
-            fin = finish_times.get(str(cid), None)
-
-        if fin is None or (not math.isfinite(float(fin))):
-            continue
-
-        n_has_finish += 1
-        fin = float(fin)
-        late = max(0.0, fin - due)
-        late_list.append((late, cid, due, fin))
-
-    if not late_list:
-        return {"sum": 0.0, "avg": 0.0, "max": 0.0, "n_late": 0, "n": 0, "top": [],
-                "n_customer": n_customer, "n_has_finish": n_has_finish}
-
-    late_list.sort(reverse=True, key=lambda x: x[0])
-    total = sum(x[0] for x in late_list)
-    n = len(late_list)
-    n_late = sum(1 for x in late_list if x[0] > 1e-9)
-    mx = late_list[0][0]
-    top = late_list[:topk]
-    return {"sum": total, "avg": total / n, "max": mx, "n_late": n_late, "n": n, "top": top,
-            "n_customer": n_customer, "n_has_finish": n_has_finish}
 
 def nearest_neighbor_route_truck_only(data: Data,
                                       truck_customers,
@@ -1660,7 +787,7 @@ def nearest_neighbor_route_truck_only(data: Data,
 
     unvisited = allowed.copy()
     while unvisited:
-        next_node = min(unvisited, key=lambda j: truck_arc_cost(data, current, j))
+        next_node = min(unvisited, key=lambda j: sim.truck_arc_cost(data, current, j))
         route.append(next_node)
         unvisited.remove(next_node)
         current = next_node
@@ -1716,9 +843,9 @@ def worst_removal(route, num_remove, data: Data, protected=None):
             continue
         a = route[pos - 1]
         b = route[pos + 1]
-        saving = (truck_arc_cost(data, a, i) +
-                  truck_arc_cost(data, i, b) -
-                  truck_arc_cost(data, a, b))
+        saving = (sim.truck_arc_cost(data, a, i) +
+                  sim.truck_arc_cost(data, i, b) -
+                  sim.truck_arc_cost(data, a, b))
         # saving 越大，说明删掉它越有利
         contributions.append((saving, pos, i))
 
@@ -1750,8 +877,8 @@ def greedy_insert(data: Data, route, removed_nodes):
         for i in range(len(new_route) - 1):
             a = new_route[i]
             b = new_route[i + 1]
-            old_cost = truck_arc_cost(data, a, b)
-            new_cost = truck_arc_cost(data, a, node) + truck_arc_cost(data, node, b)
+            old_cost = sim.truck_arc_cost(data, a, b)
+            new_cost = sim.truck_arc_cost(data, a, node) + sim.truck_arc_cost(data, node, b)
             delta = new_cost - old_cost
 
             if delta < best_delta:
@@ -1789,9 +916,9 @@ def regret_insert(data: Data, destroyed_route, removed_nodes):
             for pos in range(1, len(route)):  # 不在起点前插
                 a = route[pos - 1]
                 b = route[pos]
-                delta = (truck_arc_cost(data, a, k) +
-                         truck_arc_cost(data, k, b) -
-                         truck_arc_cost(data, a, b))
+                delta = (sim.truck_arc_cost(data, a, k) +
+                         sim.truck_arc_cost(data, k, b) -
+                         sim.truck_arc_cost(data, a, b))
                 deltas.append((delta, pos))
 
             # 按增量成本排序
@@ -1993,7 +1120,7 @@ def R_base_feasible_drone_first(data, destroyed_route, destroyed_b2d, removed_cu
 # ================== 迟到修复：局部重排算子（卡车路径重插入） ==================
 def _late_repair_get_late_truck_customers(data, route, start_time, truck_speed, eps=1e-9):
     """返回卡车路径中“已迟到”的客户列表（按 late 从大到小）：[(late, cid), ...]"""
-    arrival_times, _, _ = compute_truck_schedule(data, route, start_time, truck_speed)
+    arrival_times, _, _ = sim.compute_truck_schedule(data, route, start_time, truck_speed)
     late_list = []
     for cid in route:
         node = data.nodes[cid]
@@ -2027,15 +1154,15 @@ def _late_repair_best_reinsert_position(data, route, base_to_drone_customers, ci
         return None
 
     start_time = float(ctx.get('start_time', 0.0))
-    truck_speed = float(ctx.get('truck_speed', TRUCK_SPEED_UNITS))
-    drone_speed = float(ctx.get('drone_speed', DRONE_SPEED_UNITS))
+    truck_speed = float(ctx.get('truck_speed', sim.TRUCK_SPEED_UNITS))
+    drone_speed = float(ctx.get('drone_speed', sim.DRONE_SPEED_UNITS))
     alpha_drone = float(ctx.get('alpha_drone', 0.3))
     lambda_late = float(ctx.get('lambda_late', 50.0))
     arrival_prefix = ctx.get('arrival_prefix', None)
     eps = float(ctx.get('eps', 1e-9))
 
     # 基准
-    base_cost, _, _, _, _, base_late, _ = evaluate_truck_drone_with_time(
+    base_cost, _, _, _, _, base_late, _ = sim.evaluate_truck_drone_with_time(
         data,
         route,
         base_to_drone_customers,
@@ -2064,7 +1191,7 @@ def _late_repair_best_reinsert_position(data, route, base_to_drone_customers, ci
     for pos in range(1, len(base_route)):
         trial = base_route[:]
         trial.insert(pos, cid)
-        cost, _, _, _, _, total_late, _ = evaluate_truck_drone_with_time(
+        cost, _, _, _, _, total_late, _ = sim.evaluate_truck_drone_with_time(
             data,
             trial,
             base_to_drone_customers,
@@ -2120,7 +1247,7 @@ def _late_repair_score_bases_by_drone_lateness(
     if not base_to_drone_customers:
         return []
 
-    arrival_times, _, _ = compute_truck_schedule(data, route, start_time, truck_speed)
+    arrival_times, _, _ = sim.compute_truck_schedule(data, route, start_time, truck_speed)
     if arrival_prefix:
         # 中文注释：prefix 内固定的到达时间优先（用于动态场景：已走过的前缀不再改变）
         arrival_times = dict(arrival_times)
@@ -2171,7 +1298,7 @@ def _late_repair_best_base_reinsert(
     eps = float(ctx.get('eps', 1e-9))
 
     try:
-        base_cost, _, _, _, _, base_late, _ = evaluate_truck_drone_with_time(
+        base_cost, _, _, _, _, base_late, _ = sim.evaluate_truck_drone_with_time(
             data, route, base_to_drone_customers,
             start_time, truck_speed, drone_speed,
             alpha_drone, lambda_late,
@@ -2200,7 +1327,7 @@ def _late_repair_best_base_reinsert(
             pass
         trial = route_wo[:pos] + [base_idx] + route_wo[pos:]
         try:
-            cost, _, _, _, _, total_late, _ = evaluate_truck_drone_with_time(
+            cost, _, _, _, _, total_late, _ = sim.evaluate_truck_drone_with_time(
                 data, trial, base_to_drone_customers,
                 start_time, truck_speed, drone_speed,
                 alpha_drone, lambda_late,
@@ -2249,7 +1376,7 @@ def late_repair_truck_reinsert(data: Data, route: list, base_to_drone_customers:
     arrival_prefix = ctx.get('arrival_prefix', None)
 
     def _eval(r):
-        return evaluate_truck_drone_with_time(
+        return sim.evaluate_truck_drone_with_time(
             data, r, base_to_drone_customers,
             start_time, truck_speed, drone_speed,
             alpha_drone, lambda_late,
@@ -2267,7 +1394,7 @@ def late_repair_truck_reinsert(data: Data, route: list, base_to_drone_customers:
             break
 
         # ---- 1) 找最迟到的卡车客户（只看当前 route 内的 customer 节点） ----
-        arrival_times, _, _ = compute_truck_schedule(data, route, start_time, truck_speed)
+        arrival_times, _, _ = sim.compute_truck_schedule(data, route, start_time, truck_speed)
         if arrival_prefix:
             arrival_times = dict(arrival_times)
             arrival_times.update(arrival_prefix)
@@ -2384,8 +1511,8 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
 
     ctx["alpha_drone"] = alpha_drone
     ctx["lambda_late"] = lambda_late
-    ctx["truck_speed"] = TRUCK_SPEED_UNITS
-    ctx["drone_speed"] = DRONE_SPEED_UNITS
+    ctx["truck_speed"] = sim.TRUCK_SPEED_UNITS
+    ctx["drone_speed"] = sim.DRONE_SPEED_UNITS
     ctx["start_time"] = start_time
 
     # force_truck 集合（保证和 data 一致）
@@ -2435,14 +1562,14 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
      current_truck_late,
      current_drone_late,
      current_total_late,
-     current_truck_time) = evaluate_truck_drone_with_time(
+     current_truck_time) = sim.evaluate_truck_drone_with_time(
         data,
         current_route,
         current_b2d,
         alpha_drone=alpha_drone,
         lambda_late=lambda_late,
-        truck_speed=TRUCK_SPEED_UNITS,
-        drone_speed=DRONE_SPEED_UNITS,
+        truck_speed=sim.TRUCK_SPEED_UNITS,
+        drone_speed=sim.DRONE_SPEED_UNITS,
         start_time=start_time,
         arrival_prefix=ctx.get("arrival_prefix")
     )
@@ -2576,14 +1703,14 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
          cand_truck_late,
          cand_drone_late,
          cand_total_late,
-         cand_truck_time) = evaluate_truck_drone_with_time(
+         cand_truck_time) = sim.evaluate_truck_drone_with_time(
             data,
             cand_route,
             cand_b2d,
             alpha_drone=alpha_drone,
             lambda_late=lambda_late,
-            truck_speed=TRUCK_SPEED_UNITS,
-            drone_speed=DRONE_SPEED_UNITS,
+            truck_speed=sim.TRUCK_SPEED_UNITS,
+            drone_speed=sim.DRONE_SPEED_UNITS,
             start_time=start_time,
             arrival_prefix=ctx.get("arrival_prefix")
         )
@@ -2681,410 +1808,6 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
     # if bool(ctx.get("verbose_stat", True)):
     #     _print_operator_stats(op_stat, top_k=int(ctx.get("verbose_stat_topk", 30)))
     return best_route, best_b2d, best_cost, best_truck_dist, best_drone_dist, best_total_late, best_truck_time
-
-def compute_global_xlim_ylim(data: Data,
-                             reloc_radius=0.8,
-                             pad_min=5.0,
-                             step_align=10.0):
-    """
-    计算全局统一的 xlim/ylim（用于多个场景对比图同尺度）。
-    规则：
-      - 基于 data.nodes 的原始坐标
-      - 额外按“最大可能扰动半径”扩一圈（不依赖具体场景是否真的扰动到边界）
-      - 结果对齐到 step_align（默认 10），确保刻度整齐
-    """
-    import math
-
-    xs = [float(n.get('x', 0.0)) for n in data.nodes]
-    ys = [float(n.get('y', 0.0)) for n in data.nodes]
-
-    if not xs or not ys:
-        return (-10.0, 110.0), (-10.0, 110.0)
-
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-
-    # 扩边界：至少 pad_min，同时把“可能的扰动半径”算进去
-    # 你的坐标系里 reloc_radius=0.8 属于同一坐标尺度，因此直接加即可
-    pad = max(pad_min, float(reloc_radius) + 1.0)
-
-    x0 = math.floor((min_x - pad) / step_align) * step_align
-    x1 = math.ceil((max_x + pad) / step_align) * step_align
-    y0 = math.floor((min_y - pad) / step_align) * step_align
-    y1 = math.ceil((max_y + pad) / step_align) * step_align
-
-    # 防止太窄（保持至少 50）
-    if x1 - x0 < 50:
-        cx = 0.5 * (x0 + x1)
-        x0, x1 = cx - 25, cx + 25
-    if y1 - y0 < 50:
-        cy = 0.5 * (y0 + y1)
-        y0, y1 = cy - 25, cy + 25
-
-    return (float(x0), float(x1)), (float(y0), float(y1))
-
-def visualize_truck_drone(data: Data,
-                          truck_route,
-                          base_to_drone_customers,
-                          title="Truck + Drone Solution",
-                          show_legend=True,
-                          show_numbers=False,
-                          xlim=None,
-                          ylim=None,
-                          decision_time=None,
-                          truck_arrival=None,
-                          drone_finish=None,
-                          prefix_route=None,
-                          virtual_pos=None,
-                          relocation_decisions=None,
-                          drone_set_before=None,
-                          pad=0.0,
-                          fig_size=(8, 6),
-                          fig_dpi=120):
-    """
-    参照 GRB_dec 可视化风格（不画续航圈）：
-      - 中心仓库：黄色方块
-      - 基站：黄色五角星
-      - 无人机客户：蓝色实心点
-      - 卡车客户：蓝色空心点
-      - 卡车路径：红色带箭头（单向）
-      - 无人机路径：浅蓝色双向箭头
-    关键修复：
-      - 坐标轴/网格/刻度设置与绘图逻辑解耦：传固定 xlim/ylim 也能正常绘制
-      - 不使用 tight_layout（会在不同场景下挤压 axes 导致网格视觉不一致）
-      - 统一为右侧预留空间放 legend：fig.subplots_adjust(right=0.80)
-      - pad：允许在固定范围基础上自动扩边界（避免每次手动改范围）
-    """
-
-    _configure_matplotlib_cn_font()
-
-    # 中文注释：延迟导入 matplotlib（仅在绘图时加载，避免非绘图实验启动时引入 GUI/字体开销）
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyArrowPatch
-    from matplotlib.lines import Line2D
-
-    fig, ax = plt.subplots(figsize=fig_size, dpi=fig_dpi)
-
-    # ---------- 1) 先得到 xlim/ylim ----------
-    auto_axis = (xlim is None or ylim is None or xlim == "auto" or ylim == "auto")
-
-    if auto_axis:
-        xs = [float(n.get('x', 0.0)) for n in data.nodes]
-        ys = [float(n.get('y', 0.0)) for n in data.nodes]
-
-        # 1) 虚拟车位置（可能超出原边界）
-        if virtual_pos is not None:
-            try:
-                xs.append(float(virtual_pos[0]))
-                ys.append(float(virtual_pos[1]))
-            except Exception:
-                pass
-
-        # 2) 扰动 old/new 坐标（箭头可能超出原边界）
-        if relocation_decisions:
-            for it in relocation_decisions:
-                try:
-                    if isinstance(it, (list, tuple)) and len(it) >= 8:
-                        ox, oy, nx, ny = float(it[4]), float(it[5]), float(it[6]), float(it[7])
-                        xs.extend([ox, nx])
-                        ys.extend([oy, ny])
-                except Exception:
-                    continue
-
-        min_x = min(xs) if xs else 0.0
-        max_x = max(xs) if xs else 0.0
-        min_y = min(ys) if ys else 0.0
-        max_y = max(ys) if ys else 0.0
-
-        span = max(max_x - min_x, max_y - min_y, 1.0)
-        pad_auto = max(5.0, 0.05 * span)  # 至少留 5 个单位边距
-
-        x0 = math.floor((min_x - pad_auto) / 10.0) * 10.0
-        x1 = math.ceil((max_x + pad_auto) / 10.0) * 10.0
-        y0 = math.floor((min_y - pad_auto) / 10.0) * 10.0
-        y1 = math.ceil((max_y + pad_auto) / 10.0) * 10.0
-
-        # 防止过小范围
-        if x1 - x0 < 50:
-            cx0 = 0.5 * (x0 + x1)
-            x0, x1 = cx0 - 25, cx0 + 25
-        if y1 - y0 < 50:
-            cy0 = 0.5 * (y0 + y1)
-            y0, y1 = cy0 - 25, cy0 + 25
-
-        xlim = (float(x0), float(x1))
-        ylim = (float(y0), float(y1))
-    else:
-        # 用户给定固定范围：允许统一扩边界 pad
-        if pad and pad > 0:
-            xlim = (float(xlim[0]) - float(pad), float(xlim[1]) + float(pad))
-            ylim = (float(ylim[0]) - float(pad), float(ylim[1]) + float(pad))
-        else:
-            xlim = (float(xlim[0]), float(xlim[1]))
-            ylim = (float(ylim[0]), float(ylim[1]))
-
-    # ---------- 2) 无论 auto/固定，都统一设置坐标轴 + 刻度 + 网格 ----------
-    ax.set_xlim(xlim)
-    ax.set_ylim(ylim)
-    ax.set_aspect('equal', adjustable='box')
-
-    span_xy = max(float(xlim[1] - xlim[0]), float(ylim[1] - ylim[0]))
-    if span_xy <= 120:
-        step = 10
-    elif span_xy <= 250:
-        step = 20
-    elif span_xy <= 600:
-        step = 50
-    else:
-        step = 100
-
-    ax.set_xticks(np.arange(xlim[0], xlim[1] + 1, step))
-    ax.set_yticks(np.arange(ylim[0], ylim[1] + 1, step))
-    ax.grid(True, linestyle='--', linewidth=0.6, color='gray', alpha=0.6)
-
-    # ---------- 3) 基本索引 ----------
-    central_idx = data.central_idx
-    base_indices = [i for i, n in enumerate(data.nodes) if n.get('node_type') == 'base']
-    customer_indices = [i for i, n in enumerate(data.nodes) if n.get('node_type') == 'customer']
-
-    # ---------- 4) 进度信息：已服务客户 ----------
-    served_customers = set()
-    if decision_time is not None:
-        if truck_arrival is not None:
-            for c in customer_indices:
-                if truck_arrival.get(c, float('inf')) <= decision_time + 1e-9:
-                    served_customers.add(c)
-        if drone_finish is not None:
-            for c in customer_indices:
-                if drone_finish.get(c, float('inf')) <= decision_time + 1e-9:
-                    served_customers.add(c)
-
-    # ---------- 5) 前缀分割：已走过卡车边 ----------
-    split_idx = None
-    if decision_time is not None and prefix_route:
-        last_prefix = prefix_route[-1]
-        if last_prefix in truck_route:
-            idxs = [k for k, v in enumerate(truck_route) if v == last_prefix]
-            split_idx = idxs[-1] if idxs else None
-
-    prev_idx = None
-    next_idx = None
-    if split_idx is not None:
-        prev_idx = truck_route[split_idx]
-        if split_idx + 1 < len(truck_route):
-            next_idx = truck_route[split_idx + 1]
-
-    # ---------- 6) 计算卡车/无人机客户集合 ----------
-    drone_customers = set(c for lst in base_to_drone_customers.values() for c in lst)
-    truck_customers = set(truck_route) - set(base_indices) - {central_idx}
-    truck_customers -= drone_customers  # 强制互斥
-
-    # ---------- 7) 绘制中心 & 基站 ----------
-    cx, cy = data.nodes[central_idx]['x'], data.nodes[central_idx]['y']
-    ax.scatter(cx, cy, marker='s', s=90, c='yellow', edgecolors='black', zorder=6)
-
-    for b in base_indices:
-        bx, by = data.nodes[b]['x'], data.nodes[b]['y']
-        ax.scatter(bx, by, marker='*', s=120, c='yellow', edgecolors='black', zorder=6)
-
-    # ---------- 8) 绘制客户点（区分已服务/未服务） ----------
-    drone_unserved = [c for c in drone_customers if c in customer_indices and c not in served_customers]
-    if drone_unserved:
-        dx = [data.nodes[c]['x'] for c in drone_unserved]
-        dy = [data.nodes[c]['y'] for c in drone_unserved]
-        ax.scatter(dx, dy, c='blue', s=25, zorder=5)
-
-    drone_served = [c for c in drone_customers if c in customer_indices and c in served_customers]
-    if drone_served:
-        dx = [data.nodes[c]['x'] for c in drone_served]
-        dy = [data.nodes[c]['y'] for c in drone_served]
-        ax.scatter(dx, dy, c='gray', s=25, alpha=0.6, zorder=5)
-
-    truck_unserved = [c for c in truck_customers if c in customer_indices and c not in served_customers]
-    if truck_unserved:
-        tx = [data.nodes[c]['x'] for c in truck_unserved]
-        ty = [data.nodes[c]['y'] for c in truck_unserved]
-        ax.scatter(tx, ty, facecolors='none', edgecolors='blue', s=25, linewidths=1.5, zorder=5)
-
-    truck_served = [c for c in truck_customers if c in customer_indices and c in served_customers]
-    if truck_served:
-        tx = [data.nodes[c]['x'] for c in truck_served]
-        ty = [data.nodes[c]['y'] for c in truck_served]
-        ax.scatter(tx, ty, facecolors='none', edgecolors='gray', s=25, linewidths=1.5, alpha=0.6, zorder=5)
-
-    # ---------- 9) 位置变更对比层 ----------
-    if relocation_decisions:
-        def _valid(x, y):
-            if x is None or y is None:
-                return False
-            if isinstance(x, float) and math.isnan(x):
-                return False
-            if isinstance(y, float) and math.isnan(y):
-                return False
-            return True
-
-        drone_before = drone_set_before if drone_set_before is not None else set()
-
-        for (cidx, nid, dec, reason, ox, oy, nx, ny) in relocation_decisions:
-            if not _valid(ox, oy) or not _valid(nx, ny):
-                continue
-
-            ax.plot([ox, nx], [oy, ny], linestyle="--", color="gray", linewidth=1.5, zorder=5)
-
-            mx, my = (ox + nx) / 2.0, (oy + ny) / 2.0
-            ax.text(mx + 0.6, my + 0.6, f"{nid}", fontsize=8, color="gray", zorder=5)
-
-            if str(dec).upper() == "ACCEPT":
-                # 原位置黑点（按决策前模式）
-                if cidx in drone_before:
-                    ax.scatter([ox], [oy], s=30, c="black", edgecolors="black", linewidths=1.8, zorder=6)
-                else:
-                    ax.scatter([ox], [oy], s=30, facecolors="none", edgecolors="black", zorder=6)
-
-                ax.scatter([nx], [ny], s=25, c="red", edgecolors="red", zorder=6)
-            else:
-                ax.scatter([nx], [ny], s=55, marker="x", c="black", linewidths=2.2, zorder=15)
-
-    # ---------- 10) 可选标号 ----------
-    if show_numbers:
-        for c in customer_indices:
-            nc = data.nodes[c]
-            ax.text(nc['x'] + 0.3, nc['y'] + 0.3, str(nc.get('node_id', c)), fontsize=8)
-
-    # ---------- 11) 箭头绘制：像素级贴边 ----------
-    def __marker_radius_pixels(idx):
-        """
-        返回指定节点 idx 在当前 axes 上的 marker 等效半径（像素）。
-        与上面的 scatter s 值保持一致：
-          - 中心：s=90
-          - 基站：s=120
-          - 其他客户：s=25
-        """
-        if idx == central_idx:
-            s_points2 = 90
-        elif idx in base_indices:
-            s_points2 = 120
-        else:
-            s_points2 = 25
-
-        radius_points = (np.sqrt(s_points2) / 2.0)
-        dpi = fig.get_dpi()
-        radius_pixels = radius_points * dpi / 110.0
-        return radius_pixels
-
-    def draw_arrow_between_indices(ax_, idx_start, idx_end,
-                                  color='red', lw=1.6, style='-', double=False):
-        x1, y1 = data.nodes[idx_start]['x'], data.nodes[idx_start]['y']
-        x2, y2 = data.nodes[idx_end]['x'], data.nodes[idx_end]['y']
-
-        p1_pix = ax_.transData.transform((x1, y1))
-        p2_pix = ax_.transData.transform((x2, y2))
-
-        dx_pix = p2_pix[0] - p1_pix[0]
-        dy_pix = p2_pix[1] - p1_pix[1]
-        dist_pix = np.hypot(dx_pix, dy_pix)
-        if dist_pix < 1e-6:
-            return
-
-        r1 = __marker_radius_pixels(idx_start)
-        r2 = __marker_radius_pixels(idx_end)
-
-        ux, uy = dx_pix / dist_pix, dy_pix / dist_pix
-
-        start_adj_pix = (p1_pix[0] + ux * r1, p1_pix[1] + uy * r1)
-        end_adj_pix = (p2_pix[0] - ux * r2, p2_pix[1] - uy * r2)
-
-        start_adj_data = ax_.transData.inverted().transform(start_adj_pix)
-        end_adj_data = ax_.transData.inverted().transform(end_adj_pix)
-
-        arr = FancyArrowPatch(start_adj_data, end_adj_data,
-                              arrowstyle='-|>', color=color, linewidth=lw,
-                              mutation_scale=10, linestyle=style, alpha=0.9, zorder=4)
-        ax_.add_patch(arr)
-
-        if double:
-            arr2 = FancyArrowPatch(end_adj_data, start_adj_data,
-                                   arrowstyle='-|>', color=color, linewidth=lw,
-                                   mutation_scale=10, linestyle=style, alpha=0.9, zorder=4)
-            ax_.add_patch(arr2)
-
-    # ---------- 12) 绘制卡车路径：已走(实线) / 未走(虚线) ----------
-    for i in range(len(truck_route) - 1):
-        a, b = truck_route[i], truck_route[i + 1]
-
-        # 如果存在虚拟位置，且这一条边正好是 prev->next，则先跳过，后面单独画“已走/未走”两段
-        if (virtual_pos is not None and prev_idx is not None and next_idx is not None and a == prev_idx and b == next_idx):
-            continue
-
-        x1, y1 = data.nodes[a]['x'], data.nodes[a]['y']
-        x2, y2 = data.nodes[b]['x'], data.nodes[b]['y']
-
-        traveled = (split_idx is not None and i < split_idx)
-
-        if traveled:
-            ax.plot([x1, x2], [y1, y2], color='red', linewidth=2.2, alpha=0.95, zorder=3)
-            draw_arrow_between_indices(ax, a, b, color='red', lw=1.8, style='-')
-        else:
-            ax.plot([x1, x2], [y1, y2], color='red', linewidth=0.8, linestyle=(0, (6, 6)), alpha=0.25, zorder=2)
-            draw_arrow_between_indices(ax, a, b, color='red', lw=1.2, style='--')
-
-    # ---------- 13) 补画：部分走过的边 + 当前卡车位置 ----------
-    if virtual_pos is not None and prev_idx is not None and next_idx is not None:
-        x_cur, y_cur = virtual_pos
-        x_prev, y_prev = data.nodes[prev_idx]['x'], data.nodes[prev_idx]['y']
-        x_next, y_next = data.nodes[next_idx]['x'], data.nodes[next_idx]['y']
-
-        ax.plot([x_prev, x_cur], [y_prev, y_cur], color='red', linewidth=2.2, alpha=0.95, zorder=3)
-        ax.plot([x_cur, x_next], [y_cur, y_next], color='red', linewidth=1.0, linestyle=(0, (3, 3)), alpha=0.65, zorder=2)
-
-        ax.annotate("", xy=(x_next, y_next), xytext=(x_cur, y_cur),
-                    arrowprops=dict(arrowstyle="-|>", color="red", lw=1.0, alpha=0.45))
-
-    # ---------- 14) 绘制无人机路径：已完成(灰色) / 未完成(浅蓝) ----------
-    for b, lst in base_to_drone_customers.items():
-        for c in lst:
-            done = (decision_time is not None and drone_finish is not None and
-                    drone_finish.get(c, float('inf')) <= decision_time + 1e-9)
-
-            color = 'gray' if done else 'skyblue'
-            alpha = 0.6 if done else 1.0
-            ls = '-' if done else '--'
-
-            bx, by = data.nodes[b]['x'], data.nodes[b]['y']
-            cx2, cy2 = data.nodes[c]['x'], data.nodes[c]['y']
-            ax.plot([bx, cx2], [by, cy2], color=color, linewidth=1.0, linestyle=ls, alpha=alpha, zorder=3)
-            draw_arrow_between_indices(ax, b, c, color=color, lw=1.2, style='-', double=True)
-
-    # ---------- 15) 图例 ----------
-    legend_elements = [
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='yellow',
-               markeredgecolor='black', markersize=9, label='中心仓库'),
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='yellow',
-               markeredgecolor='black', markersize=10, label='基站'),
-        Line2D([0], [0], marker='o', color='blue', markerfacecolor='white',
-               markeredgecolor='blue', markersize=8, label='卡车客户'),
-        Line2D([0], [0], marker='o', color='blue', markerfacecolor='blue',
-               markeredgecolor='blue', markersize=8, label='无人机客户'),
-        Line2D([0], [0], color='red', lw=1.6, label='卡车路径'),
-        Line2D([0], [0], color='skyblue', lw=1.2, linestyle='-', label='无人机路径'),
-    ]
-    if show_legend:
-        ax.legend(handles=legend_elements, loc='upper left',
-                  bbox_to_anchor=(1.02, 1.0), frameon=False, fontsize=9)
-
-    ax.set_title(title)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-
-    # 关键：不要 tight_layout（它会在不同场景下动态改变轴框尺寸，导致网格视觉不一致）
-    # 统一右侧留白给 legend（所有场景一致）
-    fig.subplots_adjust(right=0.80)
-    bbox = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
-    dprint("ax size (inch):", bbox.width, bbox.height, "figsize:", fig.get_size_inches(), "dpi:", fig.dpi)
-    plt.show()
-
-    # 方便你后续在外部继续保存/加标注（不影响原调用）
-    return fig, ax
 
 def get_drone_served_before_t(full_b2d_cur, full_finish_cur, t, eps=1e-9):
     # t时刻之前已服务的无人机客户
@@ -3245,7 +1968,7 @@ def quick_filter_relocations(
     min_insert_pos = max(1, int(prefix_end_pos) + 1)
 
     recompute_cost_and_nearest_base(data_work)
-    res_work = evaluate_full_system(
+    res_work = sim.evaluate_full_system(
         data_work, route_work, b2d_work,
         alpha_drone, lambda_late,
         truck_speed, drone_speed
@@ -3273,7 +1996,7 @@ def quick_filter_relocations(
                 data_work.nodes[cid]["effective_due"] = prom_due
                 data_work.nodes[cid]["due_time"] = prom_due
                 # baseline 更新（后续请求以回退后的 due 继续评估）
-                res_work = evaluate_full_system(
+                res_work = sim.evaluate_full_system(
                     data_work, route_work, b2d_work,
                     alpha_drone, lambda_late,
                     truck_speed, drone_speed
@@ -3368,7 +2091,7 @@ def quick_filter_relocations(
                 )
 
         # 4) 评估 trial
-        res1 = evaluate_full_system(
+        res1 = sim.evaluate_full_system(
             data_trial, route_trial, b2d_trial,
             alpha_drone, lambda_late,
             truck_speed, drone_speed
@@ -3409,7 +2132,7 @@ def quick_filter_relocations(
             try:
                 data_work.nodes[cid]["effective_due"] = prom_due
                 data_work.nodes[cid]["due_time"] = prom_due
-                res_work = evaluate_full_system(
+                res_work = sim.evaluate_full_system(
                     data_work, route_work, b2d_work,
                     alpha_drone, lambda_late,
                     truck_speed, drone_speed
@@ -3444,66 +2167,11 @@ def _apply_xy(node, x, y, source="PERTURBED"):
     node["x"] = x
     node["y"] = y
     node["coord_source"] = source  # 关键：同步标记
-def print_tw_stats(data):
-    """
-    中文注释：打印时间窗统计；若识别不到 customer，会输出示例节点帮助定位字段名/取值
-    """
-    import numpy as np
-
-    nodes = getattr(data, "nodes", None)
-    if not nodes:
-        print("[TW] data.nodes 为空或不存在")
-        return
-
-    # 先必打印：节点数量与一个样例节点的 key
-    sample = nodes[0] if len(nodes) > 0 else {}
-    dprint(f"[TW] nodes={len(nodes)} sample_keys={list(sample.keys())[:12]} sample={ {k: sample.get(k) for k in list(sample.keys())[:6]} }")
-
-    def get_field(n, *keys, default=None):
-        for k in keys:
-            if k in n and n[k] is not None:
-                return n[k]
-        return default
-
-    ready, due, w = [], [], []
-    cust_cnt = 0
-
-    for n in nodes:
-        # 兼容不同字段名
-        nt = get_field(n, "NODE_TYPE", "node_type", "TYPE", "type", default="")
-        nt = str(nt).strip().lower()
-
-        # 兼容 customer 的多种写法
-        is_customer = (nt == "customer") or (nt == "c") or ("cust" in nt)
-
-        if not is_customer:
-            continue
-
-        cust_cnt += 1
-        r = float(get_field(n, "READY_TIME", "ready_time", "READY", "ready", default=0.0))
-        d = float(get_field(n, "DUE_TIME", "due_time", "DUE", "due", default=0.0))
-        ready.append(r)
-        due.append(d)
-        w.append(max(0.0, d - r))
-
-    if cust_cnt == 0:
-        # 再给一个 customer 候选排查：看前几个节点的类型字段值
-        types_preview = []
-        for i in range(min(5, len(nodes))):
-            types_preview.append(get_field(nodes[i], "NODE_TYPE", "node_type", "TYPE", "type", default=None))
-        print(f"[TW] 未识别到 customer 节点。前5个节点的 type 字段预览={types_preview}")
-        return
-
-    print(f"[TW] customers={cust_cnt} "
-          f"ready(min/mean/max)={min(ready):.2f}/{np.mean(ready):.2f}/{max(ready):.2f}  "
-          f"due(min/mean/max)={min(due):.2f}/{np.mean(due):.2f}/{max(due):.2f}  "
-          f"width(mean)={np.mean(w):.2f}h")
 
 def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, enable_plot: bool = False, verbose: bool = True, events_path: str = "", decision_log_path: str = ""):
     if verbose:
         print("[CFG-IN]", ab_cfg.get("PAIRING_MODE"), ab_cfg.get("late_hard"),
           len(ab_cfg.get("DESTROYS", [])), len(ab_cfg.get("REPAIRS", [])))
-
 
     if perturbation_times is None:
         perturbation_times = []
@@ -3537,7 +2205,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         def delta_cost(route, node_idx, pos):
             a = route[pos - 1]
             b = route[pos]
-            return float(truck_arc_cost(data, a, node_idx) + truck_arc_cost(data, node_idx, b) - truck_arc_cost(data, a, b))
+            return float(sim.truck_arc_cost(data, a, node_idx) + sim.truck_arc_cost(data, node_idx, b) - sim.truck_arc_cost(data, a, b))
 
         for c in uncovered:
             # 标记 force_truck，避免后续又被分给无人机
@@ -3603,7 +2271,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         if verbose:
             print(f"[OFFLINE] decision times overridden by events: T=1..{len(perturbation_times)}")
     # ===================== 2) 初始分类（场景0）=====================
-    base_to_drone_customers, truck_customers = classify_clients_for_drone(data)
+    base_to_drone_customers, truck_customers = sim.classify_clients_for_drone(data)
     if verbose:
         print("需要卡车服务的客户数:", len(truck_customers))
         print("各基站无人机客户数:", {b: len(cs) for b, cs in base_to_drone_customers.items()})
@@ -3616,7 +2284,6 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 reset_ready_to_zero=True
             )
 
-
     # ===================== 3) 场景0：跑一次 ALNS（No-RL）=====================
     if verbose:
         print("\n===== Advanced ALNS (No RL, official solution) =====")
@@ -3627,7 +2294,6 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
     # [PROMISE] 场景0不计迟到：避免 late_hard 护栏误伤（即使你实验配置里开启了 late_hard）
     ctx0["late_hard"] = 1e18
     ctx0["late_hard_delta"] = 1e18
-
 
     (best_route,
      best_b2d,
@@ -3651,8 +2317,8 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         ctx=ctx0
     )
 
-    arrival_times, total_time, total_late = compute_truck_schedule(
-        data, best_route, start_time=0.0, speed=TRUCK_SPEED_UNITS
+    arrival_times, total_time, total_late = sim.compute_truck_schedule(
+        data, best_route, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
     )
     depart_times, finish_times, base_finish_times = compute_multi_drone_schedule(
         data, best_b2d, arrival_times,
@@ -3668,10 +2334,10 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         if verbose:
             print(f"[PROMISE] input already *_promise.csv, skip regenerate/write: {file_path}")
     else:
-        _full_eval0_tmp = evaluate_full_system(
+        _full_eval0_tmp = sim.evaluate_full_system(
             data, best_route, best_b2d,
             alpha_drone=0.3, lambda_late=0.0,
-            truck_speed=TRUCK_SPEED_UNITS, drone_speed=DRONE_SPEED_UNITS
+            truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=DRONE_SPEED_UNITS
         )
         eta0_map = compute_eta_map(data, best_route, best_b2d, _full_eval0_tmp, drone_speed=DRONE_SPEED_UNITS)
         apply_promise_windows_inplace(data, eta0_map, promise_width_h=0.5)
@@ -3685,14 +2351,12 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         except Exception as _e:
             print(f"[PROMISE-WARN] 写出 promise nodes 失败: {_e}")
 
-
-
     # 统一口径：全系统完成时刻（卡车到达客户/基站 + 无人机完成）
     finish_all_times = dict(arrival_times)
     finish_all_times.update(finish_times)
     system_finish_time = max(total_time, max(base_finish_times.values()) if base_finish_times else 0.0)
 
-    check_disjoint(data, best_route, best_b2d)
+    sim.check_disjoint(data, best_route, best_b2d)
     if verbose:
         print("最优卡车路径（按 NODE_ID）:", [data.nodes[i]['node_id'] for i in best_route])
         print(f"最终: 成本={best_cost:.3f}, 卡车距={best_truck_dist:.3f}, "
@@ -3708,7 +2372,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
 
     # ===================== 4) 结果表：先记场景0（FULL口径）=====================
     scenario_results = []
-    full_eval0 = evaluate_full_system(
+    full_eval0 = sim.evaluate_full_system(
         data, best_route, best_b2d,
         alpha_drone=0.3, lambda_late=0.0,
         truck_speed=TRUCK_SPEED_UNITS, drone_speed=DRONE_SPEED_UNITS
@@ -3716,29 +2380,12 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
 
     # [PROMISE] 场景0：输出 late_prom/late_eff（late_eff 以冻结窗为准）
     _late_dir = (os.path.join(os.path.dirname(decision_log_path) or ".", "late_logs") if decision_log_path else "")
-    emit_scene_late_logs(_late_dir, scene_idx=0, decision_time=0.0, data=data, full_route=best_route, full_b2d=best_b2d, full_eval=full_eval0, prefix="")
+    emit_scene_late_logs(_late_dir, scene_idx=0, decision_time=0.0, data=data, full_route=best_route, full_b2d=best_b2d, full_eval=full_eval0, prefix="", drone_speed=DRONE_SPEED_UNITS)
     # 中文注释：scene=0（初始静态解）也输出迟到分解
     if DEBUG_LATE and ((DEBUG_LATE_SCENES is None) or (0 in DEBUG_LATE_SCENES)):
         # 中文注释：debug_print_lateness_topk 已在 slim 版本中移除（避免控制台大输出拖慢实验）。
         # 如需查看 TopK 迟到客户，请查 late_logs/*.csv（emit_scene_late_logs 会写出）。
         pass
-
-    # 中文注释：对“卡车客户迟到”做重插入诊断（仅用于定位问题，不影响求解逻辑）
-    if DEBUG_REINS_DIAG:
-        cid0 = DEBUG_REINS_CID
-        if cid0 is None:
-            cid0, late0 = pick_worst_late_truck_customer(data, best_route, full_eval0)
-        else:
-            late0 = None
-
-        if cid0 is None:
-            if DEBUG_LATE:
-                print("[REINS-DBG] no late truck customer in route, skip.")
-        else:
-            # 中文注释：debug_try_reinsert_one_truck_customer 已在 slim 版本中移除。
-            # 如需恢复该诊断，请从原版脚本迁回该函数实现。
-            if DEBUG_LATE:
-                print(f"[REINS-DBG] cid={cid0} late={late0} (diag helper removed in slim build)")
 
     scenario_results.append(_pack_scene_record(0, 0.0, full_eval0, num_req=0, num_acc=0, num_rej=0, alpha_drone=0.3, lambda_late=50.0))
     global_xlim, global_ylim = compute_global_xlim_ylim(
@@ -4075,7 +2722,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 if verbose:
                     print(f"    [SKIP-REPLAN] t={decision_time:.2f}h：无ACCEPT请求且无force_truck变更，跳过路径重规划，沿用当前全局计划。")
                 # 仍然记录该场景指标（全局口径，不重规划）
-                full_eval_skip = evaluate_full_system(
+                full_eval_skip = sim.evaluate_full_system(
                     data_next, full_route_cur, full_b2d_cur,
                     alpha_drone=0.3, lambda_late=50.0,
                     truck_speed=TRUCK_SPEED_UNITS, drone_speed=DRONE_SPEED_UNITS
@@ -4088,7 +2735,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
 
                 # [PROMISE] 场景日志输出（skip-replan）
                 _late_dir = (os.path.join(os.path.dirname(decision_log_path) or ".", "late_logs") if decision_log_path else "")
-                emit_scene_late_logs(_late_dir, scene_idx=scene_idx, decision_time=decision_time, data=data_next, full_route=full_route_cur, full_b2d=full_b2d_cur, full_eval=full_eval_skip, prefix="")
+                emit_scene_late_logs(_late_dir, scene_idx=scene_idx, decision_time=decision_time, data=data_next, full_route=full_route_cur, full_b2d=full_b2d_cur, full_eval=full_eval_skip, prefix="", drone_speed=DRONE_SPEED_UNITS)
                 # 推进窗口，进入下一决策点（不改变 full_* 计划）
                 data_cur = data_next
                 t_prev = decision_time
@@ -4196,7 +2843,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 for b in feasible_bases_for_drone:
                     xb, yb = data_next.nodes[b]["x"], data_next.nodes[b]["y"]
                     d = ((xi - xb) ** 2 + (yi - yb) ** 2) ** 0.5
-                    best = min(best, abs(2 * d - DRONE_RANGE_UNITS))
+                    best = min(best, abs(2 * d - sim.DRONE_RANGE_UNITS))
                 return best
 
             k_boundary = 6
@@ -4210,7 +2857,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                   f"force={len(C_force_truck)} boundary={len(C_boundary)}")
 
             # ---------- 5.6 分类（只在 allowed 内重新分配 truck/drone） ----------
-            base_to_drone_next, truck_next = classify_clients_for_drone(
+            base_to_drone_next, truck_next = sim.classify_clients_for_drone(
                 data_next,
                 allowed_customers=allowed_customers,
                 feasible_bases=feasible_bases_for_drone
@@ -4264,7 +2911,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 raise RuntimeError("alns_truck_drone 返回 b2d_next=None，请检查函数返回值。")
 
             # 本场景后缀时间表（从 decision_time 开始）
-            arrival_next, total_time_next, _ = compute_truck_schedule(
+            arrival_next, total_time_next, _ = sim.compute_truck_schedule(
                 data_next, route_next, start_time=decision_time, speed=TRUCK_SPEED_UNITS
             )
             arrival_next_merged = dict(arrival_prefix)
@@ -4278,7 +2925,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 total_time_next,
                 max(base_finish_next.values()) if base_finish_next else 0.0
             )
-            check_disjoint(data_next, route_next, b2d_next)
+            sim.check_disjoint(data_next, route_next, b2d_next)
 
             print(f"场景 {scene_idx}: 成本={cost_next:.3f}, 卡车距={truck_dist_next:.3f}, "
                   f"无人机距={drone_dist_next:.3f}, 总迟到={total_late_next:.3f}, "
@@ -4336,11 +2983,11 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
             )
             # 如果你有 guardrail_check 就保留，没有就删
             if "guardrail_check" in globals():
-                guardrail_check(data_next, full_route_next, full_b2d_next, tag=f" after-merge scene={scene_idx}")
+                sim.guardrail_check(data_next, full_route_next, full_b2d_next, tag=f" after-merge scene={scene_idx}")
 
             # FULL 全局时间轴重算（从0开始）
-            full_arrival_next, full_total_time_next, full_truck_late_next = compute_truck_schedule(
-                data_next, full_route_next, start_time=0.0, speed=TRUCK_SPEED_UNITS
+            full_arrival_next, full_total_time_next, full_truck_late_next = sim.compute_truck_schedule(
+                data_next, full_route_next, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
             )
             full_depart_next, full_finish_next, full_base_finish_next = compute_multi_drone_schedule(
                 data_next, full_b2d_next, full_arrival_next,
@@ -4361,9 +3008,9 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                     full_finish_all_next[_cid_int] = float(_fin)
 
             if "guardrail_check" in globals():
-                guardrail_check(data_next, full_route_next, full_b2d_next, tag=f" after-schedule scene={scene_idx}")
+                sim.guardrail_check(data_next, full_route_next, full_b2d_next, tag=f" after-schedule scene={scene_idx}")
 
-            full_eval = evaluate_full_system(
+            full_eval = sim.evaluate_full_system(
                 data_next, full_route_next, full_b2d_next,
                 alpha_drone=0.3, lambda_late=50.0,
                 truck_speed=TRUCK_SPEED_UNITS, drone_speed=DRONE_SPEED_UNITS
@@ -4371,14 +3018,9 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
 
             # [PROMISE] 场景日志输出（replan）
             _late_dir = (os.path.join(os.path.dirname(decision_log_path) or ".", "late_logs") if decision_log_path else "")
-            emit_scene_late_logs(_late_dir, scene_idx=scene_idx, decision_time=decision_time, data=data_next, full_route=full_route_next, full_b2d=full_b2d_next, full_eval=full_eval, prefix="")
-            # 中文注释：只在指定场景打印迟到构成（默认只看 scene=0）
-            if DEBUG_LATE and ((DEBUG_LATE_SCENES is None) or (scene_idx in DEBUG_LATE_SCENES)):
-                # 中文注释：原先用于控制台输出迟到明细的调试片段已在 slim 版本中移除。
-                # 请使用 emit_scene_late_logs 生成的 late_logs/*.csv 进行分析。
-                pass
+            emit_scene_late_logs(_late_dir, scene_idx=scene_idx, decision_time=decision_time, data=data_next, full_route=full_route_next, full_b2d=full_b2d_next, full_eval=full_eval, prefix="", drone_speed=DRONE_SPEED_UNITS)
 
-            check_info = sanity_check_full(data_next, full_route_next, full_b2d_next)
+            check_info = sim.sanity_check_full(data_next, full_route_next, full_b2d_next)
             print("[FULL-check]", check_info)
             print(f"[FULL] cost={full_eval['cost']:.3f}, system_time={full_eval['system_time']:.3f}h, "
                   f"late={full_eval['total_late']:.3f} (truck={full_eval['truck_late']:.3f}, drone={full_eval['drone_late']:.3f}), "
@@ -4408,7 +3050,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 drone_set_before.update(cs)
 
             if "guardrail_check" in globals():
-                guardrail_check(data_next, full_route_next, full_b2d_next, tag=f" before-plot scene={scene_idx}")
+                sim.guardrail_check(data_next, full_route_next, full_b2d_next, tag=f" before-plot scene={scene_idx}")
 
                         # 兼容：visualize_truck_drone 需要 8 元组 (cidx, nid, dec, reason, ox, oy, nx, ny)
             decisions_viz = _normalize_decisions_for_viz(data_cur, decisions)
@@ -4677,10 +3319,10 @@ def run_static_truck_only(
     # 二次兜底：确保无人机为空、force_truck 不被破坏
     best_route, best_b2d = enforce_force_truck_solution(data, best_route, best_b2d)
 
-    full_eval = evaluate_full_system(
+    full_eval = sim.evaluate_full_system(
         data, best_route, best_b2d,
         alpha_drone=0.3, lambda_late=50.0,
-        truck_speed=TRUCK_SPEED_UNITS, drone_speed=DRONE_SPEED_UNITS
+        truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
     )
 
     rec = {
@@ -4740,9 +3382,14 @@ def main():
     verbose = True
 
     # ===== 2) 路况系数（唯一入口：只放大卡车距离，不改速度）=====
-    road_factor = 1.5  # <<< 只改这里：1.0/1.5 对比路况绕行（卡车距离按欧氏×road_factor）
-    set_truck_road_factor(road_factor)
-    print(f"[PARAM] TRUCK_ROAD_FACTOR={TRUCK_ROAD_FACTOR:.3f}; TRUCK_SPEED_UNITS={TRUCK_SPEED_UNITS:.3f} units/h (fixed); truck_arc = euclid * {TRUCK_ROAD_FACTOR:.3f}")
+    # 初始化仿真参数
+    road_factor = 1.5
+    sim.set_simulation_params(road_factor=road_factor)
+    # 并且建议定义本地快捷变量，如果下面有用到
+    TRUCK_SPEED_UNITS = sim.get_simulation_params()["TRUCK_SPEED_UNITS"]
+    DRONE_SPEED_UNITS = sim.get_simulation_params()["DRONE_SPEED_UNITS"]
+    NUM_DRONES_PER_BASE = sim.get_simulation_params()["NUM_DRONES_PER_BASE"]
+    print(f"[PARAM] TRUCK_ROAD_FACTOR={sim.TRUCK_ROAD_FACTOR:.3f}; TRUCK_SPEED_UNITS={TRUCK_SPEED_UNITS:.3f} units/h (fixed); truck_arc = euclid * {sim.TRUCK_ROAD_FACTOR:.3f}")
 
     # ===== 3) 运行模式开关 =====
     # 3.1 静态对比：纯卡车 vs 混合（只跑 scene=0，不跑动态扰动）
@@ -4757,7 +3404,7 @@ def main():
     # ===== 4) road sanity =====
     if RUN_ROAD_SANITY:
         for rf in [1.0, 1.5]:
-            set_truck_road_factor(rf)
+            sim.set_simulation_params(rf)
             results = run_one(
                 file_path=file_path, seed=seed, ab_cfg=cfg,
                 perturbation_times=perturbation_times,
@@ -4774,7 +3421,7 @@ def main():
         pert_static = []
 
         # 5.1 混合模式（原 run_one）
-        set_truck_road_factor(road_factor)
+        sim.set_simulation_params(road_factor=road_factor)
         res_mixed = run_one(
             file_path=file_path, seed=seed, ab_cfg=cfg,
             perturbation_times=pert_static,
@@ -4783,7 +3430,7 @@ def main():
         )[0]
 
         # 5.2 纯卡车（不访问基站、不派无人机）
-        set_truck_road_factor(road_factor)
+        sim.set_simulation_params(road_factor=road_factor)
         res_truck = run_static_truck_only(
             file_path=file_path, seed=seed, ab_cfg=cfg,
             enable_plot=False, verbose=False
@@ -4805,7 +3452,7 @@ def main():
         # - events_path 为空：仅运行场景0（无动态请求）；若要动态对比请提供 events_path
         for sd in seeds:
             for _cfg in cfgs:
-                set_truck_road_factor(road_factor)
+                sim.set_simulation_params(road_factor=road_factor)
                 res = run_one(
                     file_path=file_path, seed=sd, ab_cfg=_cfg,
                     perturbation_times=perturbation_times,
