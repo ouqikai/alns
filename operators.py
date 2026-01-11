@@ -736,3 +736,58 @@ def nearest_neighbor_route_truck_only(data,
         route.append(end_idx)
 
     return route
+
+def _resolve_operator_list(names, g=None):
+    """把字符串函数名解析成函数对象；优先在当前模块(operators)查找。"""
+    # g 参数留着兼容，但实际上我们主要查 globals()
+    current_globals = globals()
+    ops_list = []
+    for nm in names:
+        fn = current_globals.get(nm, None)
+        if fn is None or not callable(fn):
+            raise RuntimeError(f"[CFG] 未找到算子函数: {nm} (请检查 operators.py)")
+        ops_list.append(fn)
+    return ops_list
+
+def build_ab_cfg(cfg: dict):
+    """把 cfg 中的字符串 DESTROYS/REPAIRS/ALLOWED_PAIRS 转成可执行函数对象。"""
+    new_cfg = dict(cfg)
+
+    # DESTROYS / REPAIRS
+    if "DESTROYS" in new_cfg and new_cfg["DESTROYS"]:
+        if isinstance(new_cfg["DESTROYS"][0], str):
+            # 直接调用上面的 _resolve_operator_list，不需要传 g 了
+            new_cfg["DESTROYS"] = _resolve_operator_list(new_cfg["DESTROYS"])
+
+    if "REPAIRS" in new_cfg and new_cfg["REPAIRS"]:
+        if isinstance(new_cfg["REPAIRS"][0], str):
+            new_cfg["REPAIRS"] = _resolve_operator_list(new_cfg["REPAIRS"])
+
+    # ALLOWED_PAIRS（paired 模式）
+    if "ALLOWED_PAIRS" in new_cfg and new_cfg["ALLOWED_PAIRS"]:
+        pairs = []
+        for dnm, rnm in new_cfg["ALLOWED_PAIRS"]:
+            # destroy
+            if isinstance(dnm, str):
+                D = globals().get(dnm)
+                if D is None or not callable(D):
+                    raise RuntimeError(f"[CFG] 未找到 destroy: {dnm}")
+            elif callable(dnm):
+                D = dnm
+            else:
+                raise RuntimeError(f"[CFG] destroy 既不是字符串也不是函数对象: {dnm}")
+
+            # repair
+            if isinstance(rnm, str):
+                R = globals().get(rnm)
+                if R is None or not callable(R):
+                    raise RuntimeError(f"[CFG] 未找到 repair: {rnm}")
+            elif callable(rnm):
+                R = rnm
+            else:
+                raise RuntimeError(f"[CFG] repair 既不是字符串也不是函数对象: {rnm}")
+
+            pairs.append((D, R))
+        new_cfg["ALLOWED_PAIRS"] = pairs
+
+    return new_cfg

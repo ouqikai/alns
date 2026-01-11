@@ -444,3 +444,54 @@ def enforce_force_truck_solution(data, route, b2d):
         route.insert(best_pos, node_idx)
 
     return route, b2d
+
+def cover_uncovered_by_truck_suffix(data, full_route, full_b2d, prefix_len, verbose=False):
+    """
+    动态拼接后工程兜底：若出现未覆盖客户（既不在卡车路径也不在无人机任务），
+    则把它们强制插入到“后缀部分”的卡车路径中（不动前缀已执行部分），避免丢点崩溃。
+    """
+    all_customers = {i for i, n in enumerate(data.nodes) if n.get("node_type") == "customer"}
+    truck_customers = {i for i in full_route
+                       if 0 <= i < len(data.nodes) and data.nodes[i].get("node_type") == "customer"}
+    drone_customers = {c for cs in full_b2d.values() for c in cs}
+    uncovered = sorted(all_customers - (truck_customers | drone_customers))
+    if not uncovered:
+        return full_route
+
+    if verbose:
+        nids = [data.nodes[i].get("node_id", i) for i in uncovered]
+        print(f"[GUARD][COVER] 发现未覆盖客户 {len(uncovered)} 个，强制插入卡车后缀路径 node_id={nids}")
+
+    r = full_route[:]
+    if len(r) < 2:
+        r.extend(uncovered)
+        return r
+
+    start_pos = max(int(prefix_len), 1)
+    end_pos = max(len(r) - 1, start_pos)
+
+    def delta_cost(route, node_idx, pos):
+        a = route[pos - 1]
+        b = route[pos]
+        return float(truck_arc_cost(data, a, node_idx) + truck_arc_cost(data, node_idx, b) - truck_arc_cost(data, a, b))
+
+    for c in uncovered:
+        # 标记 force_truck，避免后续又被分给无人机
+        try:
+            data.nodes[c]["force_truck"] = 1
+        except Exception:
+            pass
+
+        best_pos = end_pos
+        best_delta = float("inf")
+        for pos in range(start_pos, end_pos + 1):
+            try:
+                d = delta_cost(r, c, pos)
+            except Exception:
+                continue
+            if d < best_delta:
+                best_delta = d
+                best_pos = pos
+        r.insert(best_pos, c)
+
+    return r

@@ -469,3 +469,26 @@ def _print_operator_stats(op_stat: dict, top_k: int = 20):
     for r in rows[:top_k]:
         print("  - %s | %4d %4d %.2f %4d %.2f %4d %4d %4d %4d %4d %.3f" %
               (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]))
+
+def _normalize_perturbation_times(times):
+    """规范化决策时刻列表：
+    - 过滤 <=0 的时刻（t=0 的初始场景由系统自动包含，避免重复）
+    - 去重（按 1e-6 精度）
+    - 升序排序
+    """
+    import math
+    if not times:
+        return []
+    cleaned = []
+    for t in times:
+        try:
+            ft = float(t)
+        except Exception:
+            continue
+        if math.isnan(ft) or math.isinf(ft):
+            continue
+        if ft <= 1e-9:
+            continue
+        cleaned.append(round(ft, 6))
+    return sorted(set(cleaned))
+
