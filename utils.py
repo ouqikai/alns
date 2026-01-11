@@ -371,3 +371,101 @@ def emit_scene_late_logs(out_dir: str, scene_idx: int, decision_time: float, dat
         for r in rows:
             w.writerow(r)
     return {"late_prom": late_prom, "late_eff": late_eff, "csv": out_csv}
+
+def _pack_scene_record(scene_idx, t_dec, full_eval, num_req, num_acc, num_rej,
+                       alpha_drone=0.3, lambda_late=50.0):
+    """统一封装动态场景记录行，确保关键指标口径一致。"""
+    base_cost = float(full_eval.get("truck_dist_eff", full_eval["truck_dist"]))                 + float(alpha_drone) * float(full_eval["drone_dist"])
+    penalty = float(lambda_late) * float(full_eval["total_late"])
+    return {
+        "scene": int(scene_idx),
+        "t_dec": float(t_dec),
+        "cost": float(full_eval["cost"]),
+        "base_cost": base_cost,
+        "penalty": penalty,
+        "lambda_late": float(lambda_late),
+        "truck_dist": float(full_eval["truck_dist"]),
+        "drone_dist": float(full_eval["drone_dist"]),
+        "system_time": float(full_eval["system_time"]),
+        "truck_late": float(full_eval["truck_late"]),
+        "drone_late": float(full_eval["drone_late"]),
+        "total_late": float(full_eval["total_late"]),
+        "num_req": int(num_req),
+        "num_acc": int(num_acc),
+        "num_rej": int(num_rej),
+    }
+
+# ===================== 纯卡车 vs 卡车-无人机（静态距离/成本对比）=====================
+def print_summary_table(scenario_results):
+    print("\n===== 动态位置变更场景汇总 =====")
+    print("scene | t_dec | cost(obj) | base_cost | penalty | truck_dist | drone_dist | system_time | total_late | req | acc | rej")
+    for rec in scenario_results:
+        base_cost = rec.get("base_cost", None)
+        penalty = rec.get("penalty", None)
+
+        # 兼容旧结果：若未提供拆分，则用 cost 与 total_late 反推（前提：lambda_late 在 rec 或使用默认 50.0）
+        if base_cost is None or penalty is None:
+            lam = float(rec.get("lambda_late", 50.0))
+            try:
+                penalty = lam * float(rec["total_late"])
+                base_cost = float(rec["cost"]) - penalty
+            except Exception:
+                penalty = 0.0
+                base_cost = float(rec.get("cost", 0.0))
+
+        print(f"{rec['scene']:5d} | "
+              f"{rec['t_dec']:5.2f} | "
+              f"{rec['cost']:8.3f} | "
+              f"{base_cost:8.3f} | "
+              f"{penalty:7.3f} | "
+              f"{rec['truck_dist']:10.3f} | "
+              f"{rec['drone_dist']:10.3f} | "
+              f"{rec['system_time']:11.3f} | "
+              f"{rec['total_late']:9.3f} | "
+              f"{rec['num_req']:3d} | "
+              f"{rec['num_acc']:3d} | "
+                      f"{rec['num_rej']:3d}")
+        # # --- 货币口径（元）：用于论文/对比（不影响 obj 计算） ---
+        # try:
+        #     c_truck_km = float(rec.get("c_truck_km", 1.0))
+        #     alpha = float(rec.get("alpha_drone", 0.3))
+        #     c_drone_km = float(rec.get("c_drone_km", alpha * c_truck_km))
+        #     truck_km_euclid = float(rec.get("truck_dist", 0.0)) / float(SCALE_KM_PER_UNIT)
+        #     # 关键口径：truck_km 表示“已包含路况系数(绕行)后的实际卡车里程（km）”
+        #     truck_km = truck_km_euclid  # 中文注释：rec['truck_dist'] 已包含路况系数，不要二次乘
+        #     drone_km = float(rec.get("drone_dist", 0.0)) / float(SCALE_KM_PER_UNIT)
+        #     base_money = c_truck_km * truck_km + c_drone_km * drone_km
+        #     lam = float(rec.get("lambda_late", 50.0))
+        #     penalty_money = lam * float(rec.get("total_late", 0.0))
+        #     cost_money = base_money + penalty_money
+        #     print(
+        #         f"      money: cost={cost_money:.3f} base={base_money:.3f} penalty={penalty_money:.3f} "
+        #         f"(truck_km(road)={truck_km:.3f}, drone_km={drone_km:.3f}, c_truck={c_truck_km:.3f}, c_drone={c_drone_km:.3f})"
+        #     )
+        # except Exception:
+        #     pass
+
+def _print_operator_stats(op_stat: dict, top_k: int = 20):
+    """打印 ALNS 算子统计（calls/accepts/sa_reject/late_fail 等），用于验证消融是否真起作用。"""
+    if not op_stat:
+        print("[ALNS-SUM] op_stat empty")
+        return
+    rows = []
+    for k, s in op_stat.items():
+        calls = int(s.get("calls", 0))
+        acc = int(s.get("accepts", 0))
+        sarej = int(s.get("sa_reject", 0))
+        latef = int(s.get("late_fail", 0))
+        latedf = int(s.get("late_delta_fail", 0))
+        repf = int(s.get("repair_fail", 0))
+        covf = int(s.get("cover_fail", 0))
+        besth = int(s.get("best_hits", 0))
+        bestg = float(s.get("best_gain", 0.0))
+        acc_rate = (acc / calls) if calls > 0 else 0.0
+        best_rate = (besth / calls) if calls > 0 else 0.0
+        rows.append((k, calls, acc, acc_rate, besth, best_rate, sarej, latef, latedf, repf, covf, bestg))
+    rows.sort(key=lambda x: (-x[3], -x[5], -x[11]))
+    print("[ALNS-SUM] op_key | calls acc acc_rate best_hits best_rate sa_rej late_abs_fail late_delta_fail repair_fail cover_fail best_gain")
+    for r in rows[:top_k]:
+        print("  - %s | %4d %4d %.2f %4d %.2f %4d %4d %4d %4d %4d %.3f" %
+              (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]))

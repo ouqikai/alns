@@ -372,3 +372,75 @@ def guardrail_check(data, full_route, full_b2d, tag=""):
     inter = truck_customers & drone_customers
     if inter:
         raise RuntimeError(f"[GUARDRAIL]{tag} 冲突")
+
+# simulation.py (追加在文件末尾)
+
+def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None):
+    """返回客户 cid 在当前上下文下可用的基站集合。"""
+    # 1. 默认值处理（内部获取全局配置）
+    if drone_range is None:
+        drone_range = DRONE_RANGE_UNITS  # 直接使用本模块的全局变量
+
+    feas_pool = ctx.get('feasible_bases_for_drone', None)
+    if feas_pool is None:
+        feas_pool = ctx.get('bases_to_visit', [])
+
+    visited = set(ctx.get('visited_bases', []))
+
+    feas = []
+    x, y = float(data.nodes[cid]['x']), float(data.nodes[cid]['y'])
+    for b in feas_pool:
+        if b is None:
+            continue
+        b = int(b)
+        # 供货条件：基站要么已访问，要么在后续路线中
+        if (b not in route_set) and (b not in visited):
+            continue
+        bx, by = float(data.nodes[b]['x']), float(data.nodes[b]['y'])
+        d = ((x - bx) ** 2 + (y - by) ** 2) ** 0.5
+        # 覆盖判定
+        if 2.0 * d <= float(drone_range) + 1e-9:
+            feas.append(b)
+    return feas
+
+def enforce_force_truck_solution(data, route, b2d):
+    """
+    强制约束：所有 force_truck=1 的客户必须在卡车路径中，且不得出现在无人机任务中。
+    """
+    forced = [i for i in getattr(data, 'customer_indices', []) if data.nodes[i].get('force_truck', 0) == 1]
+    if not forced:
+        return route, b2d
+
+    # 1) 从无人机任务里移除
+    for b in list(b2d.keys()):
+        b2d[b] = [c for c in b2d[b] if c not in forced]
+
+    # 2) 确保在卡车路径里（若缺失则插入到末尾仓库前）
+    route_set = set(route)
+    missing = [c for c in forced if c not in route_set]
+    if not missing:
+        return route, b2d
+
+    def extra_cost_insert(r, node_idx, pos):
+        a = r[pos - 1]
+        b = r[pos]
+        # 直接调用本模块的 truck_arc_cost
+        return truck_arc_cost(data, a, node_idx) + truck_arc_cost(data, node_idx, b) - truck_arc_cost(data, a, b)
+
+    # 若路径长度不足（异常情况），直接拼接
+    if len(route) < 2:
+        route = route + missing
+        return route, b2d
+
+    for node_idx in missing:
+        best_pos = None
+        best_delta = float('inf')
+        # 插入位置：1..len(route)-1，避免插在起点之前
+        for pos in range(1, len(route)):
+            dlt = extra_cost_insert(route, node_idx, pos)
+            if dlt < best_delta:
+                best_delta = dlt
+                best_pos = pos
+        route.insert(best_pos, node_idx)
+
+    return route, b2d
