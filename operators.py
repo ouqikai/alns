@@ -5,6 +5,40 @@ import simulation as sim
 
 
 # =========================================================
+# 调试辅助（由 dynamic_logic.alns_truck_drone 透传 ctx）
+# =========================================================
+def _dbg_should_print(ctx: dict) -> bool:
+    """中文注释：仅在 dbg_alns=True 且命中节流条件时打印。"""
+    try:
+        if not bool(ctx.get("dbg_alns", False)):
+            return False
+        it = int(ctx.get("_dbg_it", 0))
+        every = max(1, int(ctx.get("_dbg_every", 50)))
+        return (it == 1) or (it % every == 0)
+    except Exception:
+        return False
+
+
+def _dbg_repair_summary(data, route, b2d, ctx, tag: str):
+    if not _dbg_should_print(ctx):
+        return
+    try:
+        cust_set = set(getattr(data, "customer_indices", []))
+        truck_set = {int(c) for c in route if int(c) in cust_set}
+        drone_set = set()
+        for _b, _cs in (b2d or {}).items():
+            for _c in _cs:
+                drone_set.add(int(_c))
+        removed_n = int(ctx.get("num_remove", 0))
+        dname = str(ctx.get("_dbg_d_name", ""))
+        rname = str(ctx.get("_dbg_r_name", ""))
+        print(f"[DBG-REPAIR] it={ctx.get('_dbg_it')} D={dname} R={rname} {tag}: "
+              f"truck={len(truck_set)} drone={len(drone_set)} removed_req={removed_n}")
+    except Exception:
+        pass
+
+
+# =========================================================
 # 基础插入/移除原语 (Primitives)
 # =========================================================
 
@@ -380,24 +414,28 @@ def drone_repair_feasible(data, route, b2d, ctx, k_moves=5, sample_k=12):
 def R_greedy_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
     r = greedy_insert(data, destroyed_route, removed_customers)
     bd = {b: lst[:] for b, lst in destroyed_b2d.items()}
+    _dbg_repair_summary(data, r, bd, ctx, tag="greedy_only")
     return r, bd
 
 
 def R_regret_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
     r = regret_insert(data, destroyed_route, removed_customers)
     bd = {b: lst[:] for b, lst in destroyed_b2d.items()}
+    _dbg_repair_summary(data, r, bd, ctx, tag="regret_only")
     return r, bd
 
 
 def R_greedy_then_drone(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
     r, bd = R_greedy_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx)
     r, bd = drone_repair_feasible(data, r, bd, ctx, k_moves=8, sample_k=10)
+    _dbg_repair_summary(data, r, bd, ctx, tag="greedy_then_drone")
     return r, bd
 
 
 def R_regret_then_drone(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
     r, bd = R_regret_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx)
     r, bd = drone_repair_feasible(data, r, bd, ctx, k_moves=8, sample_k=10)
+    _dbg_repair_summary(data, r, bd, ctx, tag="regret_then_drone")
     return r, bd
 
 
@@ -427,6 +465,7 @@ def R_base_feasible_drone_first(data, destroyed_route, destroyed_b2d, removed_cu
             route = greedy_insert(data, route, [cid])
             route_set = set(route)
 
+    _dbg_repair_summary(data, route, b2d, ctx, tag="base_feasible_drone_first")
     return route, b2d
 
 
@@ -457,7 +496,7 @@ def _late_repair_score_bases_by_drone_lateness(
         max_late = 0.0
         for c in cs:
             c = int(c)
-            due = float(data.nodes[c].get('due_time', float('inf')))
+            due = float(data.nodes[c].get('effective_due', data.nodes[c].get('due_time', float('inf'))))
             if not (due < float('inf')):
                 continue
             d = float(data.costMatrix[b][c])
@@ -632,7 +671,7 @@ def late_repair_truck_reinsert(data, route, base_to_drone_customers, ctx):
             nt = str(data.nodes[idx].get('node_type', '')).lower()
             if nt not in ('customer', 'truck_customer', 'truck'):
                 continue
-            due = float(data.nodes[idx].get('due_time', float('inf')))
+            due = float(data.nodes[idx].get('effective_due', data.nodes[idx].get('due_time', float('inf'))))
             if not (due < float('inf')):
                 continue
             t = float(arrival_times.get(idx, 0.0))

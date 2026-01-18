@@ -316,13 +316,17 @@ def visualize_truck_drone(data, truck_route, base_to_drone_customers,
             ax.text(mx + 0.6, my + 0.6, f"{nid}", fontsize=8, color="gray", zorder=5)
 
             if str(dec).upper() == "ACCEPT":
-                # 原位置黑点（按决策前模式）
-                if cidx in drone_before:
-                    ax.scatter([ox], [oy], s=30, c="black", edgecolors="black", linewidths=1.8, zorder=6)
-                else:
-                    ax.scatter([ox], [oy], s=30, facecolors="none", edgecolors="black", zorder=6)
 
-                ax.scatter([nx], [ny], s=25, c="red", edgecolors="red", zorder=6)
+                if cidx in drone_before:
+                    ax.scatter([ox], [oy], s=25, c="black", edgecolors="black", linewidths=1.5, zorder=6)
+                else:
+                    ax.scatter([ox], [oy], s=25, facecolors="none", edgecolors="black", linewidths=1.5, zorder=6)
+
+                is_final_truck = (cidx in truck_customers) and (cidx not in drone_customers)
+                if is_final_truck:
+                    ax.scatter([nx], [ny], s=25, facecolors="none", edgecolors="red", linewidths=1.5, zorder=6)
+                else:
+                    ax.scatter([nx], [ny], s=25, c="red", edgecolors="red", linewidths=1.0, zorder=6)
             else:
                 ax.scatter([nx], [ny], s=55, marker="x", c="black", linewidths=2.2, zorder=15)
 

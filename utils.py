@@ -30,81 +30,149 @@ def _is_promise_nodes_file(nodes_path: str) -> bool:
 
 def freeze_existing_promise_windows_inplace(data):
     """中文注释：
-    若输入本身就是 *_promise.csv，则认为 READY_TIME/DUE_TIME 已是冻结的承诺窗（PROM_READY/PROM_DUE）。
-    这里仅做字段初始化，确保后续事件处理与日志统计能读到 prom_ready/prom_due/effective_due。
+    若输入本身就是 *_promise.csv，则认为 READY_TIME/DUE_TIME 已是冻结的“平台承诺窗”。
+
+    目标：只保留两列时间（READY_TIME/DUE_TIME）作为承诺窗；运行态通过 effective_due 表示“有效截止”。
+    - promised ready  = node['ready_time']
+    - promised due    = node['due_time']
+    - effective due   = node.get('effective_due', node['due_time'])
+
+    这里做字段初始化：为所有 customer 补齐 effective_due（默认=承诺 due）。
     """
     for n in getattr(data, "nodes", []):
         if str(n.get("node_type", "")).lower() != "customer":
             continue
         try:
-            pr = float(n.get("ready_time", 0.0))
-        except Exception:
-            pr = 0.0
-        try:
             pd = float(n.get("due_time", 0.0))
         except Exception:
-            pd = pr
-        n["prom_ready"] = pr
-        n["prom_due"] = pd
-        n["effective_due"] = pd
-        # 中文注释：求解端后续一律用当前 due_time 作为“有效截止时间”
-        n["due_time"] = pd
+            pd = 0.0
+        # 中文注释：未发生成功变更时，有效截止=承诺截止
+        n["effective_due"] = float(n.get("effective_due", pd))
+
+# =========================
+# 时间窗统一读写入口（收口）
+# =========================
+def _to_float(x, default=0.0):
+    try:
+        v = float(x)
+        if math.isnan(v):
+            return float(default)
+        return v
+    except Exception:
+        return float(default)
+
+def prom_ready(node: dict) -> float:
+    """中文注释：平台承诺 READY（冻结窗）"""
+    if node is None:
+        return 0.0
+    return _to_float(node.get("ready_time", 0.0), 0.0)
+
+def prom_due(node: dict) -> float:
+    """中文注释：平台承诺 DUE（冻结窗）"""
+    if node is None:
+        return float("inf")
+    # 兜底：若 due_time 缺失，就至少不小于 ready
+    pr = prom_ready(node)
+    pd = _to_float(node.get("due_time", pr), pr)
+    return max(pd, pr)
+
+def eff_due(node: dict) -> float:
+    """中文注释：运行态有效截止（优先 effective_due，否则回退 prom_due）"""
+    if node is None:
+        return float("inf")
+    v = node.get("effective_due", None)
+    if v is None:
+        return prom_due(node)
+    return _to_float(v, prom_due(node))
+
+def cand_eff_due(node: dict) -> float:
+    """中文注释：候选有效截止 L = max(prom_due, prom_ready + delta_avail_h)"""
+    if node is None:
+        return float("inf")
+    pr = prom_ready(node)
+    pd = prom_due(node)
+    dav = _to_float(node.get("delta_avail_h", 0.0), 0.0)
+    return max(pd, pr + dav)
 
 def apply_promise_windows_inplace(data, eta_map: dict, promise_width_h: float = 0.5):
-    """中文注释：将 PROM_READY/PROM_DUE 写入节点，并冻结为后续场景默认时间窗；同时把 due_time 置为有效截止时间。"""
+    """中文注释：
+    用场景0解得到的 ETA 冻结承诺窗，并写回 data.nodes[*].ready_time / due_time。
+    兼容两种 eta_map 口径：
+      - key 是节点下标 idx（最常见）
+      - key 是 NODE_ID（瘦身/改写时容易变成这种）
+    """
     for i, n in enumerate(data.nodes):
-        if str(n.get("node_type","")).lower() != "customer":
+        if str(n.get("node_type", "")).lower() != "customer":
             continue
-        if i not in eta_map:
-            # 中文注释：极端情况下可能未被分配；兜底用现有 ready/due
-            pr = float(n.get("ready_time", 0.0))
-        else:
+
+        # 1) 优先按 idx 取 ETA；取不到再按 NODE_ID 取
+        if i in eta_map:
             pr = float(eta_map[i])
+        else:
+            try:
+                nid = int(n.get("node_id", -1))
+            except Exception:
+                nid = -1
+            if nid in eta_map:
+                pr = float(eta_map[nid])
+            else:
+                # 2) 兜底：仍取原 ready_time（或 0）
+                pr = float(n.get("ready_time", 0.0))
+
         pd = pr + float(promise_width_h)
+
+        # 内存里保留这些字段，便于 decision_log / debug（不要求写回 CSV）
         n["prom_ready"] = pr
         n["prom_due"] = pd
         n["effective_due"] = pd
-        # 中文注释：为了让现有 evaluate_full_system/ALNS 直接使用“冻结窗”，此处把 ready/due 写回 ready_time/due_time
+
+        # 关键：冻结窗写回两列时间（你要的“只留两列时间”）
         n["ready_time"] = pr
         n["due_time"] = pd
 
 def write_promise_nodes_csv(in_nodes_csv: str, out_nodes_csv: str, eta_map: dict, promise_width_h: float = 0.5):
-    """中文注释：输出 nodes_*_promise.csv，不覆盖原始数据集。"""
+    """中文注释：
+    输出 nodes_*_promise.csv（可选），但仍只保留 READY_TIME / DUE_TIME 两列时间，不新增 PROM_* 列，
+    避免 strict_schema=True 时读入失败。
+    同时兼容 eta_map 的 idx / NODE_ID 两种 key。
+    """
     if (out_nodes_csv is None) or (str(out_nodes_csv).strip() == ""):
         return
     os.makedirs(os.path.dirname(out_nodes_csv) or ".", exist_ok=True)
+
     with open(in_nodes_csv, "r", encoding="utf-8-sig", newline="") as f:
         r = csv.DictReader(f)
         fieldnames = list(r.fieldnames or [])
-        # 确保 PROM_* 列存在
-        if "PROM_READY" not in fieldnames:
-            fieldnames.append("PROM_READY")
-        if "PROM_DUE" not in fieldnames:
-            fieldnames.append("PROM_DUE")
-        rows = []
-        for row in r:
-            rows.append(row)
+        rows = list(r)
+
     with open(out_nodes_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for row in rows:
-            ntype = str(row.get("NODE_TYPE","")).strip().lower()
+
+        for row_idx, row in enumerate(rows):
+            ntype = str(row.get("NODE_TYPE", "")).strip().lower()
+            if ntype != "customer":
+                w.writerow(row)
+                continue
+
             try:
                 nid = int(float(row.get("NODE_ID", -1)))
             except Exception:
                 nid = -1
-            if ntype == "customer" and nid in eta_map:
+
+            pr = None
+            if row_idx in eta_map:
+                pr = float(eta_map[row_idx])
+            elif nid in eta_map:
                 pr = float(eta_map[nid])
+
+            if pr is not None:
                 pd = pr + float(promise_width_h)
                 row["READY_TIME"] = f"{pr:.3f}"
                 row["DUE_TIME"] = f"{pd:.3f}"
-                row["PROM_READY"] = f"{pr:.3f}"
-                row["PROM_DUE"] = f"{pd:.3f}"
+
             w.writerow(row)
 
-# =========================
-# 在线扰动日志（可复现）
-# =========================
 def load_events_csv(path: str):
     """读取 events.csv（仅事实，不含 accept/reject）。"""
     events = []
@@ -169,7 +237,7 @@ def save_decision_log(rows, path: str):
         "APPLIED_X", "APPLIED_Y",
         "FORCE_TRUCK", "BASE_LOCK",
         "DELTA_AVAIL_H",
-        "PROM_READY", "PROM_DUE",
+        "READY_TIME", "DUE_TIME",
         "EFFECTIVE_DUE",
         "D_COST", "D_LATE_PROM", "D_LATE_EFF"
     ]
@@ -266,9 +334,11 @@ def compute_eta_map(data, full_route, full_b2d, full_eval, *, drone_speed=None):
     return eta
 
 def _total_late_against_due(data, full_route, full_b2d, full_eval, *, due_mode: str = "prom", drone_speed=None):
-    """中文注释：计算 total_late（truck+drone），用于 late_prom 与 late_eff 对比。
-    due_mode='prom' -> 使用节点 prom_due（若缺失回退 due_time）
-    due_mode='eff'  -> 使用节点 due_time（即当前有效截止时间）
+    """中文注释：计算 total_late（truck+drone），用于 promised lateness 与 effective lateness 对比。
+
+    约定：
+    - due_mode='prom' -> 使用节点 due_time（平台承诺截止）
+    - due_mode='eff'  -> 使用节点 effective_due（若缺失则回退 due_time）
     """
     if drone_speed is None:
         raise ValueError("[utils] _total_late_against_due 必须传入 drone_speed 参数")
@@ -279,9 +349,15 @@ def _total_late_against_due(data, full_route, full_b2d, full_eval, *, due_mode: 
 
     def _get_due(c):
         n = data.nodes[c]
-        if due_mode == "prom":
-            return float(n.get("prom_due", n.get("due_time", float("inf"))))
-        return float(n.get("due_time", float("inf")))
+        if due_mode == "eff":
+            try:
+                return float(n.get("effective_due", n.get("due_time", float("inf"))))
+            except Exception:
+                return float("inf")
+        try:
+            return float(n.get("due_time", float("inf")))
+        except Exception:
+            return float("inf")
 
     # truck
     for idx in full_route:
@@ -350,8 +426,8 @@ def emit_scene_late_logs(out_dir: str, scene_idx: int, decision_time: float, dat
                 eta = float(dep.get(i, 0.0)) + float(data.costMatrix[b_found, i]) / float(drone_speed)
         else:
             eta = float("nan")
-        prom_due = float(n.get("prom_due", float("nan")))
-        eff_due = float(n.get("due_time", float("nan")))
+        prom_due = float(n.get("due_time", float("nan")))
+        eff_due = float(n.get("effective_due", prom_due))
         late_p = 0.0 if (math.isnan(eta) or math.isnan(prom_due)) else max(0.0, eta - prom_due)
         late_e = 0.0 if (math.isnan(eta) or math.isnan(eff_due)) else max(0.0, eta - eff_due)
         rows.append({

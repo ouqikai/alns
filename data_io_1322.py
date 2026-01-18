@@ -204,6 +204,12 @@ def read_data(
 
             "ready_time": float(row["READY_TIME"]),
             "due_time": float(row["DUE_TIME"]),
+            # 中文注释：有效截止时间（运行态可被成功变更更新），默认等于承诺截止 DUE_TIME
+            "effective_due": float(row["DUE_TIME"]),
+            # 中文注释：事件给出的可延长时长（小时），默认 0；由 events.csv 的 DELTA_AVAIL_H 注入
+            "delta_avail_h": 0.0,
+            "candidate_effective_due": float(row["DUE_TIME"]),
+            "reloc_type": "legacy",
             "request_time": safe_float(row["REQUEST_TIME"]),
 
             "service_time": 0.0,

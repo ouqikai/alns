@@ -2,6 +2,7 @@
 import math
 import copy
 from utils import compute_eta_map  # 如果 alns 依赖它，也可从这导
+import utils as ut
 
 # =========================
 # 全局仿真参数（带默认值）
@@ -57,6 +58,9 @@ def truck_arc_cost(data, i: int, j: int) -> float:
     """
     return float(data.costMatrix[i, j]) * float(TRUCK_ROAD_FACTOR)
 
+def _get_due_for_late(node: dict) -> float:
+    """中文注释：统一迟到截止口径：优先 effective_due，否则回退 promise due_time"""
+    return ut.eff_due(node)
 
 def compute_truck_schedule(data, route, start_time: float = 0.0, speed: float = None):
     """
@@ -98,7 +102,7 @@ def compute_truck_schedule(data, route, start_time: float = 0.0, speed: float = 
         if not ((nt == 'customer') or (nt == 'c') or ('cust' in nt)):
             continue
         arr = float(arrival_times[idx])
-        due = float(node.get('due_time', float('inf')))
+        due = _get_due_for_late(node)
         if arr > due:
             total_late += (arr - due)
 
@@ -137,7 +141,7 @@ def compute_multi_drone_schedule(data,
             base_arrival = arrival_prefix.get(base_idx, None)
         if base_arrival is None:
             base_arrival = float(default_base_arrival)
-
+        base_arrival = arrival_times.get(base_idx, None)
         drone_available = [float(base_arrival)] * int(num_drones_per_base)
 
         for c in clients:
@@ -193,15 +197,15 @@ def evaluate_truck_drone_with_time(data, route, base_to_drone, start_time=0.0, t
         for c in clients:
             d = float(data.costMatrix[base_idx, c])
             drone_dist += 2.0 * d
-            service_time = base_arrival + (2.0 * d / float(drone_speed))
-            due = float(data.nodes[c].get('due_time', float('inf')))
+            service_time = base_arrival + (d / float(drone_speed))
+            due = _get_due_for_late(data.nodes[c])
             if service_time > due:
                 drone_late += (service_time - due)
 
     truck_late = 0.0
     for idx in route:
         if data.nodes[idx].get('node_type') == 'customer':
-            due = float(data.nodes[idx].get('due_time', float('inf')))
+            due = _get_due_for_late(data.nodes[idx])
             arr = float(arrival_times.get(idx, float('inf')))
             if arr > due:
                 truck_late += (arr - due)
@@ -242,7 +246,7 @@ def evaluate_full_system(data, full_route, full_b2d,
             d_bc = data.costMatrix[b, c]
             drone_dist += 2.0 * d_bc
             arrive_c = depart[c] + d_bc / drone_speed
-            due = data.nodes[c].get('due_time', float('inf'))
+            due = _get_due_for_late(data.nodes[c])
             if arrive_c > due:
                 drone_late += (arrive_c - due)
 
@@ -280,8 +284,10 @@ def classify_clients_for_drone(data, allowed_customers=None, feasible_bases=None
         base_indices = [b for b in base_indices if b in feasible_set]
 
     central_idx = data.central_idx
-    if central_idx not in base_indices:
-        base_indices.append(central_idx)
+    # 只有“不限制 feasible_bases”时才允许把 central 加入候选基站
+    if feasible_bases is None:
+        if central_idx not in base_indices:
+            base_indices.append(central_idx)
 
     customer_indices = [i for i, n in enumerate(data.nodes) if n['node_type'] == 'customer']
     if allowed_customers is not None:
