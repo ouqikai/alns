@@ -25,7 +25,7 @@
 
 import argparse
 import math
-from typing import Dict, Tuple, List, Optional, Set, Any, Iterable
+from typing import Dict, Tuple, List, Optional, Set, Any
 
 import pandas as pd
 import gurobipy as gp
@@ -183,20 +183,17 @@ def solve_milp_return_from_df(
         drone_speed_kmh: float,
         alpha: float,
         lambda_late: float,
+        lambda_prom: float = 0.0,
         time_limit: float,
         mip_gap: float,
         unit_per_km: float,
         allowed_bases: Optional[Set[int]] = None,
-        must_visit_bases: Optional[Set[int]] = None,
-        drone_only_bases: Optional[Set[int]] = None,
-        drone_only_onhand: Optional[Dict[int, Iterable[int]]] = None,
         force_truck_customers: Optional[Set[int]] = None,
         allow_depot_as_base: bool = True,
         verbose: int = 0,
-        save_iis_path: str = "model_iis.ilp",
-        start_node: Optional[int] = None,      # 动态起点 NODE_ID（允许 -1 这种虚拟点）
-        end_node: Optional[int] = None,        # 动态终点，默认 central
-        start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
+        save_iis_path: str = "model_iis.ilp", start_node: Optional[int] = None,      # 动态起点 NODE_ID（允许 -1 这种虚拟点）
+end_node: Optional[int] = None,        # 动态终点，默认 central
+start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
 ) -> Dict[str, Any]:
     """
     将原 build_and_solve 的“建模+求解+解析”封装成可复用函数（返回结果，不做打印/画图）。
@@ -229,24 +226,24 @@ def solve_milp_return_from_df(
     nodes: Dict[int, Dict] = {}
     for _, row in df.iterrows():
         nid = int(row["NODE_ID"])
-        due_prom = float(row["DUE_TIME"])  # 承诺截止：永远用 DUE_TIME
-        due_eff = due_prom  # 有效截止：若有 EFFECTIVE_DUE 则用它
-
+        due_prom = row["DUE_TIME"]
+        due_eff = due_prom
         if "EFFECTIVE_DUE" in df.columns:
             v = row.get("EFFECTIVE_DUE", None)
             try:
                 if v is not None and (not (isinstance(v, float) and math.isnan(v))):
-                    due_eff = float(v)
+                    due_eff = v
             except Exception:
                 pass
-
         nodes[nid] = {
             "type": str(row["NODE_TYPE"]).strip(),
             "x": float(row["ORIG_X"]),
             "y": float(row["ORIG_Y"]),
             "ready": float(row["READY_TIME"]),
-            "due": float(due_eff),  # 继续保持旧行为：L 用 effective due
-            "due_prom": float(due_prom),  # 新增：prom due
+            # 有效截止：用于 MILP 的硬迟到 L
+            "due": float(due_eff),
+            # 承诺截止：用于 late_prom 统计/惩罚（可选）
+            "due_prom": float(due_prom),
             "demand": float(row["DEMAND"]) if "DEMAND" in df.columns else 0.0
         }
 
@@ -298,19 +295,14 @@ def solve_milp_return_from_df(
             dT_km[(i, j)] = dij_km
             tT_h[(i, j)] = dij_km / truck_speed_kmh
             max_dT_km = max(max_dT_km, dij_km)
-    drone_only_bases = set(int(x) for x in (drone_only_bases or []))
-    _doo = drone_only_onhand or {}
-    drone_only_onhand = {int(b): set(int(c) for c in cs) for b, cs in _doo.items()}
+
     # ---------- 无人机可行对 ----------
     feas_pairs: List[Tuple[int, int]] = []
     dD_km: Dict[Tuple[int, int], float] = {}
     tD_h: Dict[Tuple[int, int], float] = {}
     for b in drone_bases:
         xb, yb = nodes[b]["x"], nodes[b]["y"]
-        cand_customers = customers
-        if b in drone_only_bases:
-            cand_customers = sorted([c for c in customers if c in drone_only_onhand.get(b, set())])
-        for c in cand_customers:
+        for c in customers:
             xc, yc = nodes[c]["x"], nodes[c]["y"]
             dbc_unit = euclid(xb, yb, xc, yc)
             dbc_km = dbc_unit / unit_per_km
@@ -333,8 +325,6 @@ def solve_milp_return_from_df(
     u = m.addVars([i for i in V if i != depot], vtype=GRB.BINARY, name="u")
     z = m.addVars(customers, vtype=GRB.BINARY, name="z")
     y = m.addVars(feas_pairs, vtype=GRB.BINARY, name="y")
-    if int(verbose) >= 2:
-        print("[MILP-DBG] feas_pairs_for_10_11=", [(b, c) for (b, c) in feas_pairs if c in (10, 11)])
 
     T = m.addVars(V, vtype=GRB.CONTINUOUS, lb=0.0, name="T")
     # ---------- 起点时间 ----------
@@ -342,28 +332,12 @@ def solve_milp_return_from_df(
         m.addConstr(T[depot] == 0.0, name="T_depot_0")
     else:
         m.addConstr(T[start_node] == float(start_time_h), name="T_start_fix")
-    # ---------- visited drone-only base：固定时间为决策时刻，避免“时间倒流” ----------
-    # drone_only_bases：你前面新增传进来的集合（visited 且 drone-only 的基站）
-    if drone_only_bases:
-        for b in drone_only_bases:
-            b = int(b)
-            # 只对模型里存在的节点生效，并避免和 start_node 重复固定
-            if (b in V) and (b != start_node):
-                m.addConstr(T[b] == float(start_time_h), name=f"T_fix_drone_only_{b}")
 
     F = m.addVars(customers, vtype=GRB.CONTINUOUS, lb=0.0, name="F")
     L = m.addVars(customers, vtype=GRB.CONTINUOUS, lb=0.0, name="L")
-    Lp = m.addVars(customers, vtype=GRB.CONTINUOUS, lb=0.0, name="Lp")  # 承诺窗迟到
+    # 承诺迟到（用于 late_prom，可选纳入目标）
+    Lp = m.addVars(customers, vtype=GRB.CONTINUOUS, lb=0.0, name="Lp")
     p = m.addVars([i for i in V if i != depot], vtype=GRB.CONTINUOUS, lb=0.0, ub=nV - 1, name="p")
-    if must_visit_bases:
-        mv = set(int(x) for x in must_visit_bases)
-        # 仅强制“当前确实可能用于无人机派送”的基站：否则会出现‘基站没有客户也被硬访问’
-        feas_base_set = set(int(b) for (b, _) in feas_pairs)
-        for b in mv:
-            if b in V and b != depot and b != start_node:
-                if b not in feas_base_set:
-                    continue
-                m.addConstr(u[b] == 1, name=f"must_visit_base_{b}")
 
     # ---------- 约束：起终点出入度（静态闭环 / 动态开路径）----------
     if start_node == depot:
@@ -397,8 +371,6 @@ def solve_milp_return_from_df(
     # ---------- 客户访问：u[c] == z[c] ----------
     for c in customers:
         m.addConstr(u[c] == z[c], name=f"visit_customer_equals_truck_{c}")
-    for c in customers:
-        m.addConstr(Lp[c] >= F[c] - nodes[c]["due_prom"], name=f"late_prom_{c}")
 
     # ---------- 每个客户必须被服务 ----------
     y_by_c: Dict[int, List[Tuple[int, int]]] = {c: [] for c in customers}
@@ -409,7 +381,7 @@ def solve_milp_return_from_df(
 
     # ---------- 若 y[b,c]=1，则基站 b 必须被访问（b!=depot） ----------
     for (b, c) in feas_pairs:
-        if b != depot and b not in drone_only_bases:
+        if b != depot:
             m.addConstr(y[b, c] <= u[b], name=f"base_visit_if_drone_{b}_{c}")
 
     # ---------- 强制卡车客户（新增） ----------
@@ -434,9 +406,13 @@ def solve_milp_return_from_df(
     for c in customers:
         m.addConstr(F[c] >= nodes[c]["ready"], name=f"ready_{c}")
 
-    # ---------- 迟到 ----------
+    # ---------- 迟到（有效截止） ----------
     for c in customers:
         m.addConstr(L[c] >= F[c] - nodes[c]["due"], name=f"late_{c}")
+
+    # ---------- 承诺迟到（承诺截止） ----------
+    for c in customers:
+        m.addConstr(Lp[c] >= F[c] - nodes[c]["due_prom"], name=f"late_prom_{c}")
 
     # ---------- MTZ ----------
     for i in V:
@@ -458,18 +434,20 @@ def solve_milp_return_from_df(
     # ---------- 目标 ----------
     truck_dist = gp.quicksum(dT_km[(i, j)] * x[i, j] for (i, j) in x.keys())
     drone_dist = gp.quicksum(2.0 * dD_km[(b, c)] * y[b, c] for (b, c) in feas_pairs)
-    late_eff_pen = gp.quicksum(L[c] for c in customers)
+    # 有效迟到（按 EFFECTIVE_DUE）
+    late_pen = gp.quicksum(L[c] for c in customers)
+    # 承诺迟到（按 DUE_TIME/承诺截止）
     late_prom_pen = gp.quicksum(Lp[c] for c in customers)
 
+    # 中文注释：把 Units 口径的迟到权重换算到 km 口径
     lambda_late_km = float(lambda_late) / float(unit_per_km)
-    lambda_prom = float(kwargs.get("lambda_prom", 0.0)) if isinstance(locals().get("kwargs", None), dict) else 0.0
     lambda_prom_km = float(lambda_prom) / float(unit_per_km)
 
     m.setObjective(
         truck_dist + alpha * drone_dist
-        + lambda_late_km * late_eff_pen
-        + lambda_prom_km * late_prom_pen,
-        GRB.MINIMIZE
+        + lambda_late_km * late_pen
+        + lambda_prom_km * late_prom_pen
+        , GRB.MINIMIZE
     )
 
     # ---------- 求解 ----------
@@ -513,6 +491,7 @@ def solve_milp_return_from_df(
     truck_val = float(truck_dist.getValue())
     drone_val = float(drone_dist.getValue())
     late_val = float(late_pen.getValue())
+    late_prom_val = float(late_prom_pen.getValue())
     base_cost_no_late = truck_val + alpha * drone_val
 
     # route：succ 链
@@ -572,6 +551,7 @@ def solve_milp_return_from_df(
         "truck_km": truck_val,
         "drone_km": drone_val,
         "late_sum": late_val,
+        "late_prom_sum": late_prom_val,
         "base_cost_no_late": base_cost_no_late,
         "runtime_sec": float(getattr(m, "Runtime", 0.0)),
         "mip_gap": gap_val
@@ -608,7 +588,6 @@ def build_and_solve(csv_path: str,
         mip_gap=mip_gap,
         unit_per_km=unit_per_km,
         allowed_bases=None,                 # 静态脚本默认不限制
-        must_visit_bases=None,
         force_truck_customers=None,         # 静态脚本默认不强制
         allow_depot_as_base=True,
         verbose=verbose,

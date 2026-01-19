@@ -84,7 +84,8 @@ CFG_D = {
     "REPAIRS":  ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone", "R_late_repair_reinsert", "R_base_feasible_drone_first"],
     "dbg_alns": False,
     "dbg_postcheck": False,
-"disable_postcheck": 1,
+"disable_postcheck": 0,
+"lambda_prom": 0.0
 }
 
 def dprint(*args, **kwargs):
