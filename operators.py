@@ -500,7 +500,7 @@ def _late_repair_score_bases_by_drone_lateness(
             if not (due < float('inf')):
                 continue
             d = float(data.costMatrix[b][c])
-            t_svc = t_b + 2.0 * d / float(drone_speed)
+            t_svc = t_b + d / float(drone_speed)
             late = max(0.0, t_svc - due)
             if late > eps:
                 sum_late += late

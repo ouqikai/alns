@@ -169,6 +169,84 @@ def _merge_prefix_suffix(prefix_route, suffix_route):
         return prefix_route + suffix_route[1:]
     return prefix_route + suffix_route
 
+def _rewrite_allowed_order_on_template(data, template_route, allowed_set, new_route, start_idx, depot_idx, bases_set):
+    """
+    中文注释（修复版）：
+    - template_route：来自 preplan 的后缀模板（可能包含“冻结客户”与基站序）
+    - new_route：ALNS/GRB 求出的后缀路线（允许在 allowed 内发生 truck/drone 模式变化）
+
+    旧版风险：若 new_route 的“卡车客户集合”与 template_route 不一致（无人机->卡车 / 卡车->无人机），
+    len(new_seq)!=len(pos) 就原样返回 => allowed 客户可能从无人机列表被删掉却没进卡车路线 => uncovered。
+
+    新策略：
+    1) 从 new_route 抽取“卡车要访问的 allowed customer 顺序” new_seq
+    2) 扫描 template_route：
+       - frozen（不在 allowed_set）客户：原样保留
+       - allowed 客户：用 new_seq 依次替换；若 new_seq 不够，说明该客户被改为无人机服务 => 直接删除
+    3) 若 new_seq 还有剩余（说明 new 解把原本无人机客户改为卡车服务），把剩余客户按顺序插入到 depot 前
+    """
+    if not template_route or not new_route:
+        return list(template_route) if template_route is not None else []
+
+    allowed_set = set(int(x) for x in allowed_set) if allowed_set is not None else set()
+    bases_set = set(int(x) for x in bases_set) if bases_set is not None else set()
+
+    # 1) 提取 new_route 中的 allowed customer 顺序（只看卡车路线里的 customer）
+    new_seq = []
+    for x in new_route:
+        try:
+            x = int(x)
+        except Exception:
+            continue
+        if x == start_idx or x == depot_idx:
+            continue
+        if x in bases_set:
+            continue
+        if x in allowed_set and str(data.nodes[x].get("node_type", "")).lower() == "customer":
+            if x not in new_seq:
+                new_seq.append(x)
+
+    # 2) 按 template 逐个替换（允许长度不一致）
+    out = []
+    k = 0
+    for x in template_route:
+        try:
+            x = int(x)
+        except Exception:
+            continue
+
+        if x == start_idx or x == depot_idx:
+            continue
+
+        if x in bases_set:
+            out.append(x)
+            continue
+
+        is_customer = (0 <= x < len(data.nodes)) and (str(data.nodes[x].get("node_type", "")).lower() == "customer")
+        if is_customer and (x in allowed_set):
+            if k < len(new_seq):
+                out.append(int(new_seq[k]))
+                k += 1
+            else:
+                # 该客户在 new 解中已不再由卡车服务（应被无人机覆盖），从卡车模板里删除
+                pass
+        else:
+            out.append(x)
+
+    # 3) new_seq 还有剩余：说明 new 解新增了卡车客户（原本 template 没位置）=> 插入 depot 前
+    if k < len(new_seq):
+        exist = set(out)
+        for x in new_seq[k:]:
+            if x not in exist:
+                out.append(int(x))
+                exist.add(int(x))
+
+    # 4) 保证首尾
+    out = [start_idx] + [z for z in out if z != start_idx]
+    if not out or out[-1] != depot_idx:
+        out.append(depot_idx)
+
+    return out
 
 def apply_relocations_for_decision_time(
         data, t_prev, decision_time,
@@ -1247,7 +1325,21 @@ def run_decision_epoch(
     if decision_time > 1e-9:
         feasible_bases_for_drone = [b for b in feasible_bases_for_drone if b != data_cur.central_idx]
     arrival_prefix = {b: full_arrival_cur[b] for b in visited_bases if b in full_arrival_cur}
-
+    # base_onhand：已访问基站上“尚未起飞”的无人机客户集合（用于公平对齐 visited-base 放飞规则）
+    base_onhand = {int(b): set() for b in visited_bases}
+    try:
+        for _b, _cs in (full_b2d_cur or {}).items():
+            _b = int(_b)
+            if _b not in base_onhand:
+                continue
+            for _c in _cs:
+                _c = int(_c)
+                if _c in served_all:
+                    continue
+                if float(full_depart_cur.get(_c, float('inf'))) > decision_time + 1e-9:
+                       base_onhand[_b].add(_c)
+    except Exception:
+         base_onhand = {int(b): set() for b in visited_bases}
     # 3. 处理离线事件 (Events)
     client_to_base_cur = build_client_to_base_map(full_b2d_cur)
     req_override = []
@@ -1384,8 +1476,6 @@ def run_decision_epoch(
         # G0：data_next/decisions 已在上方构造
         qf_route_full, qf_b2d_full, qf_eval_preplan = None, None, None
 
-
-
     # 6. 记录 Decision Log
     for (cid, dec, nx, ny, reason) in decisions:
         cid = int(cid)
@@ -1479,7 +1569,7 @@ def run_decision_epoch(
 
         # 兜底: 未覆盖客户强制插入卡车
         full_route_next = sim.cover_uncovered_by_truck_suffix(
-            data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), verbose=verbose
+            data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), unserved_customers=unserved_all, verbose=verbose
         )
 
         # 全系统排程 + 评估
@@ -1672,6 +1762,8 @@ def run_decision_epoch(
     # =======================
     pre_suffix_cost = None
     pre_suffix_late = None
+    alpha = float(ab_cfg.get("alpha_drone", 0.3))
+    lam = float(ab_cfg.get("lambda_late", 50.0))
     if use_preplan and (init_route is not None):
         (pre_suffix_cost,
          _pre_td,
@@ -1685,12 +1777,51 @@ def run_decision_epoch(
             {b: list(cs) for b, cs in (base_to_drone_next or {}).items()},
             start_time=decision_time,
             arrival_prefix=arrival_prefix,
-            alpha_drone=0.3,
-            lambda_late=50.0,
+            alpha_drone=alpha,
+            lambda_late=lam,
             truck_speed=sim.TRUCK_SPEED_UNITS,
             drone_speed=sim.DRONE_SPEED_UNITS
         )
     planner = str(ab_cfg.get("planner", "ALNS")).upper()
+    # =======================
+    # 调试：打印 ALNS/GRB 子问题输入集合（可行域）用于对齐核对
+    # 开关：ab_cfg["dbg_planner_sets"]=True
+    # =======================
+    if bool(ab_cfg.get("dbg_planner_sets", False)):
+        def _fmt_set(name, s, k=12):
+            try:
+                arr = sorted(int(x) for x in set(s))
+            except Exception:
+                arr = sorted(list(s))
+            n = len(arr)
+            if n <= k:
+                show = arr
+            else:
+                h = k // 2
+                show = arr[:h] + ["..."] + arr[-h:]
+            return f"{name}: n={n}, sample={show}"
+
+        print(f"\n[PLANNER-SETS][BEFORE] scene={scene_idx} t={decision_time:.2f} planner={planner} start_idx={start_idx_for_alns}")
+        print(_fmt_set("served_all", served_all))
+        print(_fmt_set("unserved_all", unserved_all))
+        print(_fmt_set("visited_bases", visited_bases))
+        print(_fmt_set("bases_to_visit", bases_to_visit))
+        print(_fmt_set("feasible_bases_for_drone", feasible_bases_for_drone))
+        print(_fmt_set("allowed_customers", allowed_customers))
+        # 下面几类是你构造 allowed_customers 的来源，便于排查漏/多
+        try:
+            print(_fmt_set("req_set", req_set))
+        except Exception:
+            pass
+        try:
+            print(_fmt_set("unfinished_drone", unfinished_drone))
+        except Exception:
+            pass
+        try:
+            print(_fmt_set("forced_truck_eff", forced_truck_eff))
+        except Exception:
+            pass
+
     # 10. ALNS 求解 (Solve)
     ctx_for_alns = dict(ab_cfg)
     ctx_for_alns.update({
@@ -1701,7 +1832,7 @@ def run_decision_epoch(
         "C_boundary": C_boundary,
         "min_remove": min_remove_cfg,
         "feasible_bases_for_drone": feasible_bases_for_drone,
-        "visited_bases": set(visited_bases),
+        "visited_bases": set(visited_bases),"base_onhand": base_onhand,
         "arrival_prefix": arrival_prefix, "init_route": init_route,
         "dbg_postcheck": bool(ab_cfg.get("dbg_postcheck", False)),
     })
@@ -1734,7 +1865,7 @@ def run_decision_epoch(
             nd = data_next.nodes[nid]
             due_val = due_override
             if due_val is None:
-                due_val = float(nd.get("due_time", 0.0))
+                due_val = float(nd.get("effective_due", nd.get("due_time", 0.0)))
             rows.append(dict(
                 NODE_ID=int(nid),
                 NODE_TYPE=str(ntype),
@@ -1746,6 +1877,18 @@ def run_decision_epoch(
             ))
             seen.add(nid)
 
+        visited_drone_only_bases = []
+        try:
+            for _b in visited_bases:
+                _b = int(_b)
+                if _b == int(data_next.central_idx):
+                    continue
+                if len(base_onhand.get(_b, set())) > 0:
+                    visited_drone_only_bases.append(_b)
+        except Exception:
+            visited_drone_only_bases = []
+        for b in visited_drone_only_bases:
+            _add_row(int(b), "base", due_override=1e9)
         # start（虚拟车位置节点）——注意：类型用 truck_pos，避免被当 customer/base
         _add_row(start_idx_for_alns, "truck_pos", due_override=1e9)
 
@@ -1769,12 +1912,16 @@ def run_decision_epoch(
 
         # 2) 只允许从“未来基站”起飞（动态下通常不允许 depot 作为起飞点）
         allowed_bases = set(int(b) for b in bases_to_visit)
-
+        for b in (visited_drone_only_bases or []):
+            allowed_bases.add(int(b))
+        drone_only_onhand = {int(b): sorted(int(c) for c in base_onhand.get(int(b), set())) for b in
+                                 (visited_drone_only_bases or [])}
         # 3) 强制卡车客户（force_truck=1）
         ft = set()
         for c in allowed_customers:
             if int(data_next.nodes[c].get("force_truck", 0)) == 1:
                 ft.add(int(c))
+        must_visit_bases = set(int(b) for b in bases_to_visit)
 
         # 4) 调 Gurobi（每决策点 TimeLimit）
         res = grb.solve_milp_return_from_df(
@@ -1789,6 +1936,9 @@ def run_decision_epoch(
             time_limit=float(ab_cfg.get("grb_time_limit", 30.0)),
             mip_gap=float(ab_cfg.get("grb_mip_gap", 0.05)),
             allowed_bases=allowed_bases,
+            must_visit_bases=must_visit_bases,
+            drone_only_bases=set(visited_drone_only_bases or []),
+            drone_only_onhand=drone_only_onhand,
             allow_depot_as_base=False,  # 动态后缀下建议关掉
             force_truck_customers=ft,
             verbose=int(ab_cfg.get("grb_verbose", 0)),
@@ -1796,6 +1946,21 @@ def run_decision_epoch(
             start_time_h=float(decision_time),
         )
 
+        if bool(ab_cfg.get("dbg_planner_sets", True)):
+            print(f"[PLANNER-SETS][AFTER-GRB] sol_count={int(res.get('sol_count', 0))} gap={res.get('mip_gap', None)} obj={res.get('obj', None)}")
+            # GRB 的输入集合
+            print(f"[PLANNER-SETS][AFTER-GRB] df_sub_rows={len(df_sub)} allowed_bases(n)={len(allowed_bases)} force_truck(n)={len(ft)}")
+            # GRB 的输出解结构
+            try:
+                r = res.get("route", [])
+                da = res.get("drone_assign", {}) or {}
+                print(f"[PLANNER-SETS][AFTER-GRB] route_len={len(r)} route_head={r[:10]} route_tail={r[-10:] if len(r)>10 else r}")
+                print(f"[PLANNER-SETS][AFTER-GRB] drone_assign_bases={sorted(list(da.keys()))} total_drone_customers={sum(len(v) for v in da.values())}")
+            except Exception as e:
+                print("[PLANNER-SETS][AFTER-GRB] parse error:", e)
+
+        alpha = float(ab_cfg.get("alpha_drone", 0.3))
+        lam = float(ab_cfg.get("lambda_late", 50.0))
         if int(res.get("sol_count", 0)) <= 0 or (not res.get("route", [])):
             # 失败：回滚到 preplan 后缀
             route_next = list(init_route) if init_route is not None else []
@@ -1822,8 +1987,8 @@ def run_decision_epoch(
                 {b: list(cs) for b, cs in (b2d_next or {}).items()},
                 start_time=decision_time,
                 arrival_prefix=arrival_prefix,
-                alpha_drone=0.3,
-                lambda_late=50.0,
+                alpha_drone=alpha,
+                lambda_late=lam,
                 truck_speed=sim.TRUCK_SPEED_UNITS,
                 drone_speed=sim.DRONE_SPEED_UNITS
             )
@@ -1843,12 +2008,73 @@ def run_decision_epoch(
             start_idx=start_idx_for_alns, start_time=decision_time, bases_to_visit=bases_to_visit,
             ctx=ctx_for_alns
         )
+        if bool(ab_cfg.get("dbg_planner_sets", True)):
+            print(f"[PLANNER-SETS][AFTER-ALNS] suffix_cost={alns_suffix_cost:.3f} suffix_late={alns_suffix_late:.3f}")
+            print(f"[PLANNER-SETS][AFTER-ALNS] route_len={len(route_next)} route_head={route_next[:10]} route_tail={route_next[-10:] if len(route_next)>10 else route_next}")
+            try:
+                total_d = sum(len(v) for v in (b2d_next or {}).values())
+                print(f"[PLANNER-SETS][AFTER-ALNS] drone_assign_bases={sorted(list((b2d_next or {}).keys()))} total_drone_customers={total_d}")
+            except Exception as e:
+                print("[PLANNER-SETS][AFTER-ALNS] parse error:", e)
 
     # 11. 合并解 (Merge)
-    # 处理 suffix 头部可能的虚拟节点
-    suffix_for_full = route_next[:]
-    if suffix_for_full and (data_next.nodes[suffix_for_full[0]].get('node_id') == -1):
-        suffix_for_full = suffix_for_full[1:]
+
+    # 中文注释：
+    # full 评估必须在“同一条物理轨迹”上进行：
+    # - suffix 求解的起点是 start_idx_for_alns（truck_pos 虚拟节点）
+    # - 同时 use_preplan 时，冻结客户（allowed 之外的未服务客户）必须保留在后缀里，不能丢给 cover_uncovered 去乱插
+
+    allowed_set_local = set(allowed_customers)
+
+    # 1) 选后缀骨架：只有在“确实存在冻结客户”时才套用 preplan 的模板
+    frozen_set = set(unserved_all) - set(allowed_customers)
+    need_template_freeze = (
+            use_preplan
+            and (init_route is not None)
+            and isinstance(init_route, (list, tuple))
+            and (len(init_route) >= 2)
+            and (len(frozen_set) > 0)
+    )
+
+    if need_template_freeze:
+        suffix_template = list(init_route)
+        suffix_for_full = _rewrite_allowed_order_on_template(
+            data_next,
+            template_route=suffix_template,
+            allowed_set=allowed_set_local,
+            new_route=list(route_next),
+            start_idx=start_idx_for_alns,  # ✅ 必须补上这一行
+            depot_idx=data_next.central_idx,
+            bases_set=set(int(b) for b in bases_to_visit)
+        )
+    else:
+        suffix_for_full = list(route_next)
+
+    # 2) 稳健：确保 full 后缀以 truck_pos(start_idx) 开头（不要再删除它）
+    if (not suffix_for_full) or (suffix_for_full[0] != start_idx_for_alns):
+        suffix_for_full = [start_idx_for_alns] + [x for x in suffix_for_full if x != start_idx_for_alns]
+        # 2.5) 若本轮为了保留冻结客户而套用了模板，则 suffix 的 post-check 也必须基于
+        #      实际将要执行的 suffix_for_full（否则会出现“suffix 看起来更好，但 full 更差”的假象）
+        if need_template_freeze:
+            try:
+                _c, _, _, _, _, _late, _ = sim.evaluate_truck_drone_with_time(
+                    data_next,
+                    suffix_for_full,
+                    (b2d_next or {}),
+                    start_time=float(decision_time),
+                    arrival_prefix=arrival_prefix,
+                    alpha_drone=0.3,
+                    lambda_late=50.0,
+                    truck_speed=sim.TRUCK_SPEED_UNITS,
+                    drone_speed=sim.DRONE_SPEED_UNITS,
+                    num_drones_per_base=sim.NUM_DRONES_PER_BASE,
+                    default_base_arrival=float(decision_time),
+                )
+                alns_suffix_cost = float(_c)
+                alns_suffix_late = float(_late)
+            except Exception as e:
+                if verbose or bool(ab_cfg.get("dbg_postcheck", False)):
+                    print(f"[POST-DBG] recompute suffix_on_template failed: {e}")
 
     full_route_next = _merge_prefix_suffix(prefix_route, suffix_for_full)
 
@@ -1867,7 +2093,7 @@ def run_decision_epoch(
 
     # 兜底: 未覆盖客户强制插入卡车
     full_route_next = sim.cover_uncovered_by_truck_suffix(
-        data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), verbose=verbose
+        data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), unserved_customers=unserved_all, verbose=verbose
     )
 
     # 12. 全系统排程 (Full Schedule)
@@ -1892,7 +2118,7 @@ def run_decision_epoch(
     )
     # 13.x 事后复核：若 ALNS 把 preplan 做坏了则回滚（保证“决策阈值”最终仍成立）
     if (qf_eval_preplan is not None) and (qf_route_full is not None) and (qf_b2d_full is not None):
-        eps = 1e-9
+        eps = float(ab_cfg.get("postcheck_eps", 1e-6))
         # 注意：下面字段名按你 evaluate_full_system 的实际 key 来改（你现在汇总表里有 cost(obj)、total_late）
         alns_cost = float(full_eval.get("cost(obj)", full_eval.get("cost", 0.0)))
         alns_late = float(full_eval.get("total_late", 0.0))
@@ -1954,24 +2180,49 @@ def run_decision_epoch(
                   f"vs PRE cost={_f(pre_suffix_cost)}, late={_f(pre_suffix_late)}) | "
                   f"full({planner_tag} cost={_f(alns_cost)}, late={_f(alns_late)} "
                   f"vs PRE cost={_f(pre_cost)}, late={_f(pre_late)})")
+        planner_tag = str(ab_cfg.get("planner", ab_cfg.get("planner_name", "ALNS"))).upper()
+        disable_postcheck = (ab_cfg.get("disable_postcheck", 0) == 1)
 
-        if bad:
+        if (not disable_postcheck) and bad:
+            # 1) 回滚必须无条件执行（不要放在 verbose/dbg 里面）
+            #    下面这行用你自己的回滚函数/赋值替换
+            # rollback_to_preplan() / route_next = pre_route_next / b2d_next = pre_b2d_next ...
+            do_rollback = True
+
+            # 2) 打印只是可选
             if verbose or bool(ab_cfg.get("dbg_postcheck", False)):
-                if use_suffix_check:
-                    print(f"[POST-CHECK] rollback (suffix): "
-                          f"{planner_tag}(cost={alns_suffix_cost:.3f},late={alns_suffix_late:.3f}) > "
+                reasons = []
+                if bad_suffix:
+                    reasons.append("suffix-worse")
+                if bad_full:
+                    reasons.append("qf-threshold")
+                if bad_full_late:
+                    reasons.append("late-hard")
+                reason_tag = "+".join(reasons) if reasons else "unknown"
+
+                label = "suffix" if (bad_suffix and not (bad_full or bad_full_late)) else "full"
+                if label == "suffix":
+                    print(f"[POST-CHECK] rollback ({label}:{reason_tag}): "
+                          f"{planner_tag}(cost={alns_suffix_cost:.3f},late={alns_suffix_late:.3f}) vs "
                           f"PRE(cost={pre_suffix_cost:.3f},late={pre_suffix_late:.3f})")
                 else:
-                    print(f"[POST-CHECK] rollback (full): "
-                          f"{planner_tag}(cost={alns_cost:.3f},late={alns_late:.3f}) > "
-                          f"PRE(cost={pre_cost:.3f},late={pre_late:.3f})")
+                    print(f"[POST-CHECK] rollback ({label}:{reason_tag}): "
+                          f"{planner_tag}(cost={alns_cost:.3f},late={alns_late:.3f}) vs "
+                          f"PRE(cost={pre_cost:.3f},late={pre_late:.3f}) | "
+                          f"Δcost={alns_cost - pre_cost:.3f} (max={qf_cost_max:.3f}) "
+                          f"Δlate={alns_late - pre_late:.3f} (max={qf_late_max:.3f})")
+
+            # 3) 真正执行回滚（示意；你用自己已有的那段“恢复 pre_*”代码替换）
+            if do_rollback:
+                # route_next = pre_route_next; b2d_next = pre_b2d_next; depart_next = pre_depart_next; ...
+                pass
 
             full_route_next = list(qf_route_full)
             full_b2d_next = {b: list(cs) for b, cs in qf_b2d_full.items()}
 
             # 兜底覆盖 + 重算排程 + 重算评估（与下面原流程一致）
             full_route_next = sim.cover_uncovered_by_truck_suffix(
-                data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), verbose=verbose
+                data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), unserved_customers=unserved_all, verbose=verbose
             )
             full_arrival_next, full_total_time_next, _ = sim.compute_truck_schedule(
                 data_next, full_route_next, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS

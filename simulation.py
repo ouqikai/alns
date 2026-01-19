@@ -141,7 +141,6 @@ def compute_multi_drone_schedule(data,
             base_arrival = arrival_prefix.get(base_idx, None)
         if base_arrival is None:
             base_arrival = float(default_base_arrival)
-        base_arrival = arrival_times.get(base_idx, None)
         drone_available = [float(base_arrival)] * int(num_drones_per_base)
 
         for c in clients:
@@ -381,7 +380,7 @@ def guardrail_check(data, full_route, full_b2d, tag=""):
 
 # simulation.py (追加在文件末尾)
 
-def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None):
+def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None, base_onhand=None):
     """返回客户 cid 在当前上下文下可用的基站集合。"""
     # 1. 默认值处理（内部获取全局配置）
     if drone_range is None:
@@ -392,6 +391,8 @@ def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None):
         feas_pool = ctx.get('bases_to_visit', [])
 
     visited = set(ctx.get('visited_bases', []))
+    # 已访问基站的“在手货”映射：base_idx -> set(customer_idx)
+    base_onhand = ctx.get("base_onhand", {}) or {}
 
     feas = []
     x, y = float(data.nodes[cid]['x']), float(data.nodes[cid]['y'])
@@ -399,9 +400,16 @@ def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None):
         if b is None:
             continue
         b = int(b)
-        # 供货条件：基站要么已访问，要么在后续路线中
-        if (b not in route_set) and (b not in visited):
-            continue
+        # 供货条件：
+        # - 未访问基站：必须在后续路线上（route_set）
+        # - 已访问基站：只有“货在该基站的客户(base_onhand)”才允许发飞
+        if b in visited:
+            onhand_set = base_onhand.get(b, set())
+            if cid not in set(onhand_set):
+                continue
+        else:
+            if b not in route_set:
+                continue
         bx, by = float(data.nodes[b]['x']), float(data.nodes[b]['y'])
         d = ((x - bx) ** 2 + (y - by) ** 2) ** 0.5
         # 覆盖判定
@@ -451,12 +459,17 @@ def enforce_force_truck_solution(data, route, b2d):
 
     return route, b2d
 
-def cover_uncovered_by_truck_suffix(data, full_route, full_b2d, prefix_len, verbose=False):
+def cover_uncovered_by_truck_suffix(data, full_route, full_b2d, prefix_len, unserved_customers=None, verbose=False):
     """
     动态拼接后工程兜底：若出现未覆盖客户（既不在卡车路径也不在无人机任务），
     则把它们强制插入到“后缀部分”的卡车路径中（不动前缀已执行部分），避免丢点崩溃。
     """
-    all_customers = {i for i, n in enumerate(data.nodes) if n.get("node_type") == "customer"}
+    # 中文注释：只兜底“当前未服务”的客户，避免把已服务客户/历史已完成任务又插回路线
+    if unserved_customers is None:
+        all_customers = {i for i, n in enumerate(data.nodes) if n.get("node_type") == "customer"}
+    else:
+        all_customers = {int(i) for i in unserved_customers if
+                         0 <= int(i) < len(data.nodes) and data.nodes[int(i)].get("node_type") == "customer"}
     truck_customers = {i for i in full_route
                        if 0 <= i < len(data.nodes) and data.nodes[i].get("node_type") == "customer"}
     drone_customers = {c for cs in full_b2d.values() for c in cs}

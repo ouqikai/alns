@@ -67,11 +67,11 @@ CFG_A = {
 CFG_D = {
     "NAME": "D_full_structured",
     "PAIRING_MODE": "free",
-    "late_hard": 1.0,  # 建议显式写在 cfg 里（要更严就 0.10）
-    "late_hard_delta": 3.0,
+    "late_hard": 3.0,  # 建议显式写在 cfg 里（要更严就 0.10）
+    "late_hard_delta": 1.0,
     # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
-    "qf_cost_max": 9999,   # 决策阶段：接受请求的Δcost上限
-    "qf_late_max": 9999,   # 决策阶段：接受请求的Δlate上限（小时）
+    "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
+    "qf_late_max": 0.3,   # 决策阶段：接受请求的Δlate上限（小时）
 
     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
     "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
@@ -83,7 +83,8 @@ CFG_D = {
     "DESTROYS": ["D_random_route", "D_worst_route", "D_reloc_focus_v2", "D_switch_coverage"],
     "REPAIRS":  ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone", "R_late_repair_reinsert", "R_base_feasible_drone_first"],
     "dbg_alns": False,
-    "dbg_postcheck": True,
+    "dbg_postcheck": False,
+"disable_postcheck": 1,
 }
 
 def dprint(*args, **kwargs):
@@ -116,6 +117,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
     try:
         ab_cfg.setdefault("dbg_alns", bool(DBG_ALNS))
         ab_cfg.setdefault("dbg_every", int(DBG_EVERY))
+        ab_cfg.setdefault("dbg_planner_sets", True)  # 中文注释：打印 ALNS/GRB 输入集合核对
     except Exception:
         pass
     # ===================== 1) 读取数据（场景0：全原始坐标）=====================
@@ -653,12 +655,14 @@ def main():
     print("[BOOT]", __file__, "DEBUG_LATE=", DEBUG_LATE, "DEBUG_LATE_SCENES=", DEBUG_LATE_SCENES)
 
     # ===== 1) 实验输入 =====
+    # file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
     file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"  # 可选：离线事件脚本（仅事实，不含 accept/reject），为空则不使用
+    events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
     seed = 2025
     cfg = dict(CFG_D)
-    # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
-    cfg["planner"] = "ALNS"
+    cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
+    # cfg["planner"] = "ALNS"
     cfg["grb_time_limit"] = 30  # 每个决策点的 MILP 限时（秒）
     cfg["grb_mip_gap"] = 0.00  # 可选
     cfg["grb_verbose"] = 0  # 可选：0 安静，1 输出更多
