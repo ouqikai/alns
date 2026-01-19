@@ -1325,21 +1325,7 @@ def run_decision_epoch(
     if decision_time > 1e-9:
         feasible_bases_for_drone = [b for b in feasible_bases_for_drone if b != data_cur.central_idx]
     arrival_prefix = {b: full_arrival_cur[b] for b in visited_bases if b in full_arrival_cur}
-    # base_onhand：已访问基站上“尚未起飞”的无人机客户集合（用于公平对齐 visited-base 放飞规则）
-    base_onhand = {int(b): set() for b in visited_bases}
-    try:
-        for _b, _cs in (full_b2d_cur or {}).items():
-            _b = int(_b)
-            if _b not in base_onhand:
-                continue
-            for _c in _cs:
-                _c = int(_c)
-                if _c in served_all:
-                    continue
-                if float(full_depart_cur.get(_c, float('inf'))) > decision_time + 1e-9:
-                       base_onhand[_b].add(_c)
-    except Exception:
-         base_onhand = {int(b): set() for b in visited_bases}
+
     # 3. 处理离线事件 (Events)
     client_to_base_cur = build_client_to_base_map(full_b2d_cur)
     req_override = []
@@ -1832,7 +1818,7 @@ def run_decision_epoch(
         "C_boundary": C_boundary,
         "min_remove": min_remove_cfg,
         "feasible_bases_for_drone": feasible_bases_for_drone,
-        "visited_bases": set(visited_bases),"base_onhand": base_onhand,
+        "visited_bases": set(visited_bases),
         "arrival_prefix": arrival_prefix, "init_route": init_route,
         "dbg_postcheck": bool(ab_cfg.get("dbg_postcheck", False)),
     })
@@ -1859,36 +1845,56 @@ def run_decision_epoch(
         rows = []
         seen = set()
 
-        def _add_row(nid: int, ntype: str, due_override=None):
+        def _add_row(nid: int, ntype: str, due_override=None, effective_due_override=None):
+
+            """向 GRB 子问题 df_sub 追加一行。
+
+            - 对 customer：DUE_TIME=承诺截止(due_time)，EFFECTIVE_DUE=有效截止(effective_due)
+
+            - 对非 customer：两者都给一个极大值即可（不参与迟到约束）
+
+            """
+
             if nid in seen:
+
                 return
+
             nd = data_next.nodes[nid]
-            due_val = due_override
-            if due_val is None:
-                due_val = float(nd.get("effective_due", nd.get("due_time", 0.0)))
+
+            due_prom = due_override
+
+            if due_prom is None:
+
+                due_prom = float(nd.get('due_time', 0.0))
+
+            due_eff = effective_due_override
+
+            if due_eff is None:
+
+                due_eff = float(nd.get('effective_due', due_prom))
+
             rows.append(dict(
+
                 NODE_ID=int(nid),
+
                 NODE_TYPE=str(ntype),
-                ORIG_X=float(nd.get("x", 0.0)),
-                ORIG_Y=float(nd.get("y", 0.0)),
-                DEMAND=float(nd.get("demand", 0.0)),
-                READY_TIME=float(nd.get("ready_time", 0.0)),
-                DUE_TIME=float(due_val),
+
+                ORIG_X=float(nd.get('x', 0.0)),
+
+                ORIG_Y=float(nd.get('y', 0.0)),
+
+                DEMAND=float(nd.get('demand', 0.0)),
+
+                READY_TIME=float(nd.get('ready_time', 0.0)),
+
+                DUE_TIME=float(due_prom),
+
+                EFFECTIVE_DUE=float(due_eff),
+
             ))
+
             seen.add(nid)
 
-        visited_drone_only_bases = []
-        try:
-            for _b in visited_bases:
-                _b = int(_b)
-                if _b == int(data_next.central_idx):
-                    continue
-                if len(base_onhand.get(_b, set())) > 0:
-                    visited_drone_only_bases.append(_b)
-        except Exception:
-            visited_drone_only_bases = []
-        for b in visited_drone_only_bases:
-            _add_row(int(b), "base", due_override=1e9)
         # start（虚拟车位置节点）——注意：类型用 truck_pos，避免被当 customer/base
         _add_row(start_idx_for_alns, "truck_pos", due_override=1e9)
 
@@ -1899,29 +1905,34 @@ def run_decision_epoch(
         for b in bases_to_visit:
             _add_row(int(b), "base", due_override=1e9)
 
-        # customers（用 EFFECTIVE_DUE 优先作为 DUE）
+        # customers（DUE_TIME=承诺截止 due_time；EFFECTIVE_DUE=有效截止 effective_due）
+
         for c in allowed_customers:
-            if str(data_next.nodes[c].get("node_type", "")).lower() != "customer":
+
+            if str(data_next.nodes[c].get('node_type', '')).lower() != 'customer':
+
                 continue
-            due_eff = data_next.nodes[c].get("effective_due", None)
+
+            due_prom = data_next.nodes[c].get('due_time', 0.0)
+
+            due_eff = data_next.nodes[c].get('effective_due', None)
+
             if due_eff is None:
-                due_eff = data_next.nodes[c].get("due_time", 0.0)
-            _add_row(int(c), "customer", due_override=float(due_eff))
+
+                due_eff = due_prom
+
+            _add_row(int(c), 'customer', due_override=float(due_prom), effective_due_override=float(due_eff))
 
         df_sub = pd.DataFrame(rows)
 
         # 2) 只允许从“未来基站”起飞（动态下通常不允许 depot 作为起飞点）
         allowed_bases = set(int(b) for b in bases_to_visit)
-        for b in (visited_drone_only_bases or []):
-            allowed_bases.add(int(b))
-        drone_only_onhand = {int(b): sorted(int(c) for c in base_onhand.get(int(b), set())) for b in
-                                 (visited_drone_only_bases or [])}
+
         # 3) 强制卡车客户（force_truck=1）
         ft = set()
         for c in allowed_customers:
             if int(data_next.nodes[c].get("force_truck", 0)) == 1:
                 ft.add(int(c))
-        must_visit_bases = set(int(b) for b in bases_to_visit)
 
         # 4) 调 Gurobi（每决策点 TimeLimit）
         res = grb.solve_milp_return_from_df(
@@ -1933,21 +1944,22 @@ def run_decision_epoch(
             drone_speed_kmh=float(ab_cfg.get("drone_speed_kmh", 60.0)),
             alpha=float(ab_cfg.get("alpha_drone", 0.3)),
             lambda_late=float(ab_cfg.get("lambda_late", 50.0)),
+            lambda_prom=float(ab_cfg.get("lambda_prom", 0.0)),
             time_limit=float(ab_cfg.get("grb_time_limit", 30.0)),
             mip_gap=float(ab_cfg.get("grb_mip_gap", 0.05)),
             allowed_bases=allowed_bases,
-            must_visit_bases=must_visit_bases,
-            drone_only_bases=set(visited_drone_only_bases or []),
-            drone_only_onhand=drone_only_onhand,
             allow_depot_as_base=False,  # 动态后缀下建议关掉
             force_truck_customers=ft,
             verbose=int(ab_cfg.get("grb_verbose", 0)),
             start_node=int(start_idx_for_alns),
             start_time_h=float(decision_time),
         )
+        print("[GRB-DBG] allowed_bases=", sorted(list(allowed_bases)))
+        print("[GRB-DBG] drone_assign_total=", sum(len(v) for v in (res.get("drone_assign") or {}).values()),
+              " keys=", list((res.get("drone_assign") or {}).keys())[:5])
 
         if bool(ab_cfg.get("dbg_planner_sets", True)):
-            print(f"[PLANNER-SETS][AFTER-GRB] sol_count={int(res.get('sol_count', 0))} gap={res.get('mip_gap', None)} obj={res.get('obj', None)}")
+            print(f"[PLANNER-SETS][AFTER-GRB] sol_count={int(res.get('sol_count', 0))} gap={res.get('gap', None)} obj={res.get('obj', None)}")
             # GRB 的输入集合
             print(f"[PLANNER-SETS][AFTER-GRB] df_sub_rows={len(df_sub)} allowed_bases(n)={len(allowed_bases)} force_truck(n)={len(ft)}")
             # GRB 的输出解结构
@@ -2180,17 +2192,15 @@ def run_decision_epoch(
                   f"vs PRE cost={_f(pre_suffix_cost)}, late={_f(pre_suffix_late)}) | "
                   f"full({planner_tag} cost={_f(alns_cost)}, late={_f(alns_late)} "
                   f"vs PRE cost={_f(pre_cost)}, late={_f(pre_late)})")
-        planner_tag = str(ab_cfg.get("planner", ab_cfg.get("planner_name", "ALNS"))).upper()
-        disable_postcheck = (ab_cfg.get("disable_postcheck", 0) == 1)
 
-        if (not disable_postcheck) and bad:
-            # 1) 回滚必须无条件执行（不要放在 verbose/dbg 里面）
-            #    下面这行用你自己的回滚函数/赋值替换
-            # rollback_to_preplan() / route_next = pre_route_next / b2d_next = pre_b2d_next ...
-            do_rollback = True
-
-            # 2) 打印只是可选
+        if bad:
             if verbose or bool(ab_cfg.get("dbg_postcheck", False)):
+                planner_tag = str(ab_cfg.get("planner", "ALNS")).upper()
+                if planner_tag in ("GRB", "GUROBI"):
+                    planner_tag = "GRB"
+                elif planner_tag == "ALNS":
+                    planner_tag = "ALNS"
+
                 reasons = []
                 if bad_suffix:
                     reasons.append("suffix-worse")
@@ -2211,11 +2221,6 @@ def run_decision_epoch(
                           f"PRE(cost={pre_cost:.3f},late={pre_late:.3f}) | "
                           f"Δcost={alns_cost - pre_cost:.3f} (max={qf_cost_max:.3f}) "
                           f"Δlate={alns_late - pre_late:.3f} (max={qf_late_max:.3f})")
-
-            # 3) 真正执行回滚（示意；你用自己已有的那段“恢复 pre_*”代码替换）
-            if do_rollback:
-                # route_next = pre_route_next; b2d_next = pre_b2d_next; depart_next = pre_depart_next; ...
-                pass
 
             full_route_next = list(qf_route_full)
             full_b2d_next = {b: list(cs) for b, cs in qf_b2d_full.items()}
