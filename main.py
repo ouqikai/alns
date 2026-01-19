@@ -662,8 +662,8 @@ def main():
     events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
     seed = 2025
     cfg = dict(CFG_D)
-    cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
-    # cfg["planner"] = "ALNS"
+    # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
+    cfg["planner"] = "ALNS"
     cfg["grb_time_limit"] = 30  # 每个决策点的 MILP 限时（秒）
     cfg["grb_mip_gap"] = 0.00  # 可选
     cfg["grb_verbose"] = 0  # 可选：0 安静，1 输出更多

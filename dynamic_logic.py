@@ -1841,100 +1841,73 @@ def run_decision_epoch(
         # -----------------------
         # 走 Gurobi：滚动重规划后缀
         # -----------------------
-        # 1) 组装子问题 DataFrame（只包含：start + depot + bases_to_visit + allowed_customers）
+        # 1) 组装子问题 DataFrame
+        # 改动：节点集合 = start + depot + feasible_bases_for_drone (含 future & visited) + allowed_customers
+        # 这样保证 GRB 的拓扑图里包含 ALNS 能用到的所有基站
+        bases_for_grb = set(bases_to_visit) | set(feasible_bases_for_drone)
+
         rows = []
         seen = set()
 
         def _add_row(nid: int, ntype: str, due_override=None, effective_due_override=None):
-
-            """向 GRB 子问题 df_sub 追加一行。
-
-            - 对 customer：DUE_TIME=承诺截止(due_time)，EFFECTIVE_DUE=有效截止(effective_due)
-
-            - 对非 customer：两者都给一个极大值即可（不参与迟到约束）
-
-            """
-
             if nid in seen:
-
                 return
-
             nd = data_next.nodes[nid]
-
             due_prom = due_override
-
             if due_prom is None:
-
                 due_prom = float(nd.get('due_time', 0.0))
-
             due_eff = effective_due_override
-
             if due_eff is None:
-
                 due_eff = float(nd.get('effective_due', due_prom))
 
             rows.append(dict(
-
                 NODE_ID=int(nid),
-
                 NODE_TYPE=str(ntype),
-
                 ORIG_X=float(nd.get('x', 0.0)),
-
                 ORIG_Y=float(nd.get('y', 0.0)),
-
                 DEMAND=float(nd.get('demand', 0.0)),
-
                 READY_TIME=float(nd.get('ready_time', 0.0)),
-
                 DUE_TIME=float(due_prom),
-
                 EFFECTIVE_DUE=float(due_eff),
-
             ))
-
             seen.add(nid)
 
-        # start（虚拟车位置节点）——注意：类型用 truck_pos，避免被当 customer/base
+        # start（虚拟车位置节点）
         _add_row(start_idx_for_alns, "truck_pos", due_override=1e9)
 
         # depot（central）
         _add_row(data_next.central_idx, "central", due_override=1e9)
 
-        # bases_to_visit（未来基站）
-        for b in bases_to_visit:
+        # bases (关键修复：使用并集，确保 visited base 也在图里)
+        for b in bases_for_grb:
             _add_row(int(b), "base", due_override=1e9)
 
-        # customers（DUE_TIME=承诺截止 due_time；EFFECTIVE_DUE=有效截止 effective_due）
-
+        # customers
         for c in allowed_customers:
-
             if str(data_next.nodes[c].get('node_type', '')).lower() != 'customer':
-
                 continue
-
             due_prom = data_next.nodes[c].get('due_time', 0.0)
-
             due_eff = data_next.nodes[c].get('effective_due', None)
-
             if due_eff is None:
-
                 due_eff = due_prom
-
             _add_row(int(c), 'customer', due_override=float(due_prom), effective_due_override=float(due_eff))
 
         df_sub = pd.DataFrame(rows)
 
-        # 2) 只允许从“未来基站”起飞（动态下通常不允许 depot 作为起飞点）
-        allowed_bases = set(int(b) for b in bases_to_visit)
+        # 2) allowed_bases：限制哪些基站允许作为无人机起飞点
+        # 逻辑：必须在 feasible_bases_for_drone 范围内（由 ALNS 逻辑决定哪些 visited base 还有货）
+        allowed_bases_grb = set(int(b) for b in feasible_bases_for_drone)
 
-        # 3) 强制卡车客户（force_truck=1）
+        # 新增：识别哪些可用基站是“已访问过的”（不需要卡车再去一次）
+        visited_bases_grb = set(int(b) for b in visited_bases) & allowed_bases_grb
+
+        # 3) 强制卡车客户
         ft = set()
         for c in allowed_customers:
             if int(data_next.nodes[c].get("force_truck", 0)) == 1:
                 ft.add(int(c))
 
-        # 4) 调 Gurobi（每决策点 TimeLimit）
+        # 4) 调 Gurobi
         res = grb.solve_milp_return_from_df(
             df_sub,
             unit_per_km=float(ab_cfg.get("unit_per_km", 5.0)),
@@ -1947,21 +1920,22 @@ def run_decision_epoch(
             lambda_prom=float(ab_cfg.get("lambda_prom", 0.0)),
             time_limit=float(ab_cfg.get("grb_time_limit", 30.0)),
             mip_gap=float(ab_cfg.get("grb_mip_gap", 0.05)),
-            allowed_bases=allowed_bases,
-            allow_depot_as_base=False,  # 动态后缀下建议关掉
+            allowed_bases=allowed_bases_grb,
+            visited_bases_for_drone=visited_bases_grb,  # 新增参数
+            allow_depot_as_base=False,
             force_truck_customers=ft,
             verbose=int(ab_cfg.get("grb_verbose", 0)),
             start_node=int(start_idx_for_alns),
             start_time_h=float(decision_time),
         )
-        print("[GRB-DBG] allowed_bases=", sorted(list(allowed_bases)))
+        print("[GRB-DBG] allowed_bases=", sorted(list(allowed_bases_grb)))
+        print("[GRB-DBG] visited_drone_bases=", sorted(list(visited_bases_grb)))
         print("[GRB-DBG] drone_assign_total=", sum(len(v) for v in (res.get("drone_assign") or {}).values()),
               " keys=", list((res.get("drone_assign") or {}).keys())[:5])
-
         if bool(ab_cfg.get("dbg_planner_sets", True)):
-            print(f"[PLANNER-SETS][AFTER-GRB] sol_count={int(res.get('sol_count', 0))} gap={res.get('gap', None)} obj={res.get('obj', None)}")
+            print(f"[PLANNER-SETS][AFTER-GRB] sol_count={int(res.get('sol_count', 0))} gap={res.get('mip_gap', None)} obj={res.get('obj', None)}")
             # GRB 的输入集合
-            print(f"[PLANNER-SETS][AFTER-GRB] df_sub_rows={len(df_sub)} allowed_bases(n)={len(allowed_bases)} force_truck(n)={len(ft)}")
+            print(f"[PLANNER-SETS][AFTER-GRB] df_sub_rows={len(df_sub)} allowed_bases(n)={len(allowed_bases_grb)} force_truck(n)={len(ft)}")
             # GRB 的输出解结构
             try:
                 r = res.get("route", [])

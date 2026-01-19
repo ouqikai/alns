@@ -188,12 +188,14 @@ def solve_milp_return_from_df(
         mip_gap: float,
         unit_per_km: float,
         allowed_bases: Optional[Set[int]] = None,
+        visited_bases_for_drone: Optional[Set[int]] = None,  # <--- 必须补上这个参数
         force_truck_customers: Optional[Set[int]] = None,
         allow_depot_as_base: bool = True,
         verbose: int = 0,
-        save_iis_path: str = "model_iis.ilp", start_node: Optional[int] = None,      # 动态起点 NODE_ID（允许 -1 这种虚拟点）
-end_node: Optional[int] = None,        # 动态终点，默认 central
-start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
+        save_iis_path: str = "model_iis.ilp",
+        start_node: Optional[int] = None,
+        end_node: Optional[int] = None,
+        start_time_h: float = 0.0,
 ) -> Dict[str, Any]:
     """
     将原 build_and_solve 的“建模+求解+解析”封装成可复用函数（返回结果，不做打印/画图）。
@@ -312,9 +314,16 @@ start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
                 dD_km[(b, c)] = dbc_km
                 tD_h[(b, c)] = dbc_km / drone_speed_kmh
 
-    max_due = max(nodes[c]["due"] for c in customers) if customers else 0.0
-    M_time = (nV * max_dT_km / truck_speed_kmh) + max_due + 10.0
+    # 原代码：
+    # max_due = max(nodes[c]["due"] for c in customers) if customers else 0.0
+    # M_time = (nV * max_dT_km / truck_speed_kmh) + max_due + 10.0
 
+    # 修改后：
+    max_due = max(nodes[c]["due"] for c in customers) if customers else 0.0
+    # 诊断打印原 M 值
+    original_M = (nV * max_dT_km / truck_speed_kmh) + max_due + 10.0
+    # 暴力增大 M (例如 10000)，防止 leakage
+    M_time = 100000.0
     # ---------- 建模 ----------
     m = gp.Model("static_truck_drone_milp")
     m.Params.OutputFlag = 1 if int(verbose) else 0
@@ -379,10 +388,22 @@ start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
     for c in customers:
         m.addConstr(z[c] + gp.quicksum(y[pair] for pair in y_by_c[c]) == 1, name=f"serve_once_{c}")
 
-    # ---------- 若 y[b,c]=1，则基站 b 必须被访问（b!=depot） ----------
-    for (b, c) in feas_pairs:
-        if b != depot:
-            m.addConstr(y[b, c] <= u[b], name=f"base_visit_if_drone_{b}_{c}")
+        # ---------- 若 y[b,c]=1，则基站 b 必须被访问（b!=depot） ----------
+        # 修正：如果 b 是已访问过的基站（且 ALNS 判定有货），则不需要卡车再次访问 (y <= u 不加)
+        # 但需要锁定 T[b] = start_time，保证无人机发射时间正确
+        if visited_bases_for_drone is None:
+            visited_bases_for_drone = set()
+
+        # 1. 对 future bases: 加上 y <= u 约束
+        for (b, c) in feas_pairs:
+            if b != depot and b not in visited_bases_for_drone:
+                m.addConstr(y[b, c] <= u[b], name=f"base_visit_if_drone_{b}_{c}")
+
+        # 2. 对 visited bases: 锁定时间 T[b] = start_time (即刻发射)
+        for b in visited_bases_for_drone:
+            # 注意：如果该基站不在 V 中 (df_sub 没加)，这里会报错；但 dynamic_logic 已修复 df_sub
+            if b in T:
+                m.addConstr(T[b] == float(start_time_h), name=f"time_fix_visited_{b}")
 
     # ---------- 强制卡车客户（新增） ----------
     if force_truck_customers:
@@ -403,8 +424,6 @@ start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
         m.addConstr(F[c] <= T[c] + M_time * (1 - z[c]), name=f"F_truck_ub_{c}")
     for (b, c) in feas_pairs:
         m.addConstr(F[c] >= T[b] + tD_h[(b, c)] - M_time * (1 - y[b, c]), name=f"F_drone_lb_{b}_{c}")
-    for c in customers:
-        m.addConstr(F[c] >= nodes[c]["ready"], name=f"ready_{c}")
 
     # ---------- 迟到（有效截止） ----------
     for c in customers:
@@ -430,7 +449,6 @@ start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
                 p[i] - p[j] + nV * x[i, j] <= (nV - 1) + nV * (1 - u[i]) + nV * (1 - u[j]),
                 name=f"mtz_{i}_{j}"
             )
-
     # ---------- 目标 ----------
     truck_dist = gp.quicksum(dT_km[(i, j)] * x[i, j] for (i, j) in x.keys())
     drone_dist = gp.quicksum(2.0 * dD_km[(b, c)] * y[b, c] for (b, c) in feas_pairs)
@@ -485,7 +503,6 @@ start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
             "runtime_sec": float(getattr(m, "Runtime", 0.0)),
             "mip_gap": None
         }
-
     # ---------- 解析 ----------
     obj = float(m.ObjVal)
     truck_val = float(truck_dist.getValue())
@@ -534,7 +551,50 @@ start_time_h: float = 0.0,             # 决策时刻 t_dec（绝对时间）
         if y[b, c].X > 0.5:
             drone_assign.setdefault(b, []).append(c)
 
-    # gap（time limit 下可能有）
+    # ---------- [ALIGN-DIAG] 对齐诊断：用 Python 侧逻辑重算 Units 成本 ----------
+    # 目的：确认 GRB 的 KM 目标是否与 ALNS 的 Units 目标严格线性对应
+    try:
+        # 1. 简易欧氏距离函数（带路况系数）
+        def _dist_units(n1, n2):
+            dx = nodes[n1]["x"] - nodes[n2]["x"]
+            dy = nodes[n1]["y"] - nodes[n2]["y"]
+            d = math.hypot(dx, dy)
+            return d * truck_road_factor  # 必须乘路况系数
+
+        def _drone_units(n1, n2):
+            dx = nodes[n1]["x"] - nodes[n2]["x"]
+            dy = nodes[n1]["y"] - nodes[n2]["y"]
+            d = math.hypot(dx, dy)
+            return d * 1.0  # 无人机无路况系数
+
+        # 2. 重算 Truck Dist (Units)
+        calc_truck_units = 0.0
+        if route and len(route) > 1:
+            for k in range(len(route) - 1):
+                calc_truck_units += _dist_units(route[k], route[k + 1])
+
+        # 3. 重算 Drone Dist (Units)
+        calc_drone_units = 0.0
+        for b, cs in drone_assign.items():
+            for c in cs:
+                calc_drone_units += 2.0 * _drone_units(b, c)
+
+        # 4. 单位换算验证
+        # unit_per_km = 5.0 implies: Dist_Units = Dist_KM * 5.0
+        ratio_truck = calc_truck_units / max(1e-9, truck_val)
+        ratio_drone = calc_drone_units / max(1e-9, drone_val)
+
+        # 5. 打印诊断
+        print(f"\n[ALIGN-DIAG] GRB_Obj_KM={obj:.3f} | Late_H={late_val:.3f}")
+        print(f"  [TRUCK] GRB_KM={truck_val:.3f} * {unit_per_km} = {truck_val * unit_per_km:.3f} (Expected Units)")
+        print(f"          Re-Calc={calc_truck_units:.3f} (Actual Units) | Ratio={ratio_truck:.3f}")
+        print(f"  [DRONE] GRB_KM={drone_val:.3f} * {unit_per_km} = {drone_val * unit_per_km:.3f} (Expected Units)")
+        print(f"          Re-Calc={calc_drone_units:.3f} (Actual Units) | Ratio={ratio_drone:.3f}")
+
+    except Exception as _e:
+        print(f"[ALIGN-DIAG] Error: {_e}")
+
+    # Gap (keep existing logic)
     gap_val = None
     try:
         gap_val = float(m.MIPGap)
@@ -588,6 +648,7 @@ def build_and_solve(csv_path: str,
         mip_gap=mip_gap,
         unit_per_km=unit_per_km,
         allowed_bases=None,                 # 静态脚本默认不限制
+        visited_bases_for_drone=None,
         force_truck_customers=None,         # 静态脚本默认不强制
         allow_depot_as_base=True,
         verbose=verbose,
