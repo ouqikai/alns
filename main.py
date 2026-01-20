@@ -88,6 +88,40 @@ CFG_D = {
 "lambda_prom": 0.0
 }
 
+CFG_GREEDY = {
+    "NAME": "Baseline_Greedy",
+    "method": "Greedy",  # 标识符，用于输出 CSV
+    "planner": "ALNS",  # 强制使用 ALNS (哪怕 max_iter=0)
+    "alns_max_iter": 0,  # 关键：0迭代，只做构造/插入
+    "remove_fraction": 0.0,  # 不重要
+    "min_remove": 0,  # 不重要
+    "late_hard": 1e18,  # 贪婪通常不做硬约束，或者你可以设为和 G3 一样
+    "late_hard_delta": 1e18,
+
+    # 算子列表其实不运行，但为了防报错保留默认
+    "DESTROYS": ["D_random_route"],
+    "REPAIRS": ["R_greedy_only"],
+}
+
+CFG_TRUCK = {
+    "NAME": "Baseline_TruckOnly",
+    "method": "TruckOnly",
+    "planner": "ALNS",  # 使用 ALNS 优化纯卡车路径
+    "alns_max_iter": 1000,  # 允许充分优化
+    "force_truck_mode": True,  # <--- 自定义开关：强制纯卡车
+
+    # 纯卡车不需要复杂的 Destroy，基本的 Random/Worst 即可
+    "DESTROYS": ["D_random_route", "D_worst_route"],
+    "REPAIRS": ["R_greedy_only", "R_regret_only"],  # 只用纯卡车 Repair
+
+    "late_hard": 0.5,  # 保持一致
+    "late_hard_delta": 1.0,
+    "qf_cost_max": 30.0,
+    "qf_late_max": 0.3,
+    "sa_T_start": 50.0,
+    "sa_T_end": 1.0,
+    "remove_fraction": 0.15,
+}
 def dprint(*args, **kwargs):
     """统一的调试打印开关，避免到处散落 print"""
     if DEBUG:
@@ -452,41 +486,45 @@ def run_compare_suite(
     cfg_base.setdefault("dbg_postcheck", False)
     cfg_base.setdefault("alns_max_iter", 1000)
 
-    # 各组配置
-    cfg_g0 = dict(cfg_base)
-    cfg_g0.update({"method": "G0", "g0_policy": "reject_all_keep_plan"})
+    # 1. 定义配置
+    # -----------------------------------------------
+    # G1: Greedy / Preplan (基线：无重排)
+    # -----------------------------------------------
+    cfg_greedy = dict(base_cfg)
+    cfg_greedy.update({
+        "name": "Baseline_Greedy",
+        "method": "Greedy"  # 对应 dynamic_logic 里 G1 的逻辑
+    })
 
-    cfg_g1 = dict(cfg_base)
-    cfg_g1.update({"method": "G1"})
+    # -----------------------------------------------
+    # TruckOnly: 纯卡车 (消融：无无人机) -> 需要在上一步 dynamic_logic 里加拦截
+    # -----------------------------------------------
+    cfg_truck = dict(base_cfg)
+    cfg_truck.update({
+        "name": "Baseline_TruckOnly",
+        "method": "TruckOnly",
+        "force_truck_mode": True,  # 开启纯卡车模式开关
+        # 纯卡车可以用较强的算子，保证公平对比
+        "alns_max_iter": 1000,
+        "DESTROYS": ["D_random_route", "D_worst_route"],
+        "REPAIRS": ["R_greedy_only", "R_regret_only"]
+    })
 
-    cfg_g2 = dict(cfg_base)
-    cfg_g2.update({"method": "G2"})
-    # G2 弱探索：低温度/低破坏强度（这里给保守默认，可按需再调）
-    try:
-        t0 = float(cfg_g2.get("sa_T_start", 50.0))
-        t1 = float(cfg_g2.get("sa_T_end", 1.0))
-        cfg_g2["sa_T_start"] = max(1.0, t0 * 0.2)
-        cfg_g2["sa_T_end"] = max(0.1, t1 * 0.2)
-    except Exception:
-        cfg_g2["sa_T_start"], cfg_g2["sa_T_end"] = 10.0, 0.2
+    # -----------------------------------------------
+    # G3: Proposed (你的主方法)
+    # -----------------------------------------------
+    cfg_proposed = dict(base_cfg)
+    cfg_proposed.update({
+        "name": "Proposed_Method",
+        "method": "G3"
+    })
 
-    try:
-        rf = float(cfg_g2.get("remove_fraction", 0.10))
-        cfg_g2["remove_fraction"] = max(0.03, min(0.08, rf * 0.5))
-    except Exception:
-        cfg_g2["remove_fraction"] = 0.06
-
-    try:
-        mr = int(cfg_g2.get("min_remove", 3))
-        cfg_g2["min_remove"] = max(1, min(2, mr))
-    except Exception:
-        cfg_g2["min_remove"] = 2
-
-    cfg_g3 = dict(cfg_base)
-    cfg_g3.update({"method": "G3"})
-
-    groups = [("G0", cfg_g0), ("G1", cfg_g1), ("G2", cfg_g2), ("G3", cfg_g3)]
-
+    # 2. 构造对比列表 (删除 G0, G2)
+    groups = [
+        ("Greedy", cfg_greedy),  # 对应原来的 G1
+        ("TruckOnly", cfg_truck),  # 新增
+        ("Proposed", cfg_proposed)  # 对应原来的 G3
+    ]
     all_rows = []
 
     for gname, cfg in groups:
@@ -656,16 +694,16 @@ def main():
     print("[BOOT]", __file__, "DEBUG_LATE=", DEBUG_LATE, "DEBUG_LATE_SCENES=", DEBUG_LATE_SCENES)
 
     # ===== 1) 实验输入 =====
-    # file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
-    # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
+    file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
     # file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
-    file_path = r"D:\代码\ALNS+DL\OR-Tool\100\nodes_100_seed2023_20260113_152036_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\100\events_100_seed2023_20260113_152036.csv"
+    # file_path = r"D:\代码\ALNS+DL\OR-Tool\100\nodes_100_seed2023_20260113_152036_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\OR-Tool\100\events_100_seed2023_20260113_152036.csv"
     seed = 2025
     cfg = dict(CFG_D)
-    cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
-    # cfg["planner"] = "ALNS"
+    # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
+    cfg["planner"] = "ALNS"
     cfg["grb_time_limit"] = 1800  # 每个决策点的 MILP 限时（秒）
     cfg["grb_mip_gap"] = 0.00  # 可选
     cfg["grb_verbose"] = 0  # 可选：0 安静，1 输出更多
@@ -699,7 +737,7 @@ def main():
     RUN_ROAD_SANITY = False
 
     # 3.4 对照组套件：G0–G3（动态对比）
-    RUN_COMPARE_SUITE = False
+    RUN_COMPARE_SUITE = True
 
     # ===== 4) road sanity =====
     if RUN_ROAD_SANITY:

@@ -872,8 +872,8 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
 
         if ctx["drone_range"] is None:
             raise RuntimeError("[GUARD] 未找到无人机航程常量：请检查 sim.DRONE_RANGE_UNITS")
-    # 2) bases_to_visit：若没传，就默认所有基站（含 central）
-    if not bases_to_visit:
+    # 2) bases_to_visit：若没传(None)，就默认所有基站；若传了空列表[]，就保持为空
+    if bases_to_visit is None:  # <--- 修改这里：只在 None 时才自动填充
         all_bases = [i for i, n in enumerate(data.nodes) if n.get("node_type") == "base"]
         if data.central_idx not in all_bases:
             all_bases.append(data.central_idx)
@@ -1316,26 +1316,27 @@ def run_decision_epoch(
     all_bases = [i for i, n in enumerate(data_cur.nodes) if n.get('node_type') == 'base']
     if data_cur.central_idx not in all_bases:
         all_bases.append(data_cur.central_idx)
-    # [FIX] 逻辑修正：不再依赖 route_set_cur。
-    # 只要是“物理上未访问”的基站，都应作为未来的候选基站，允许求解器重新将其加入路径。
+
     visited_bases = []
     bases_to_visit = []
 
     for b in all_bases:
-        # 判断基站是否已访问：看历史到达时间是否 <= 当前决策时间
         t_arr = full_arrival_cur.get(b, float('inf'))
-
         if t_arr <= decision_time + 1e-9:
             visited_bases.append(b)
         else:
-            # 即使它不在当前路线上(t_arr=inf)，只要还没路过，就属于“未来可访问”
             bases_to_visit.append(b)
 
-    # 动态阶段不允许从中心仓库再次起飞（除非它作为终点），通常 visited 包含 central
     feasible_bases_for_drone = sorted(set(visited_bases + bases_to_visit))
-    # 动态阶段不允许从中心仓库起飞（车已离开）
     if decision_time > 1e-9:
         feasible_bases_for_drone = [b for b in feasible_bases_for_drone if b != data_cur.central_idx]
+
+    # ========== [新增逻辑：拦截纯卡车模式] ==========
+    if bool(ab_cfg.get("force_truck_mode", False)):
+        feasible_bases_for_drone = []  # 清空可用基站 -> 无人机无法起飞
+        bases_to_visit = []  # 也不强制卡车访问基站（除非它在路径上作为 shortcut）
+        if verbose:
+            print(f"    [MODE] Force Truck Mode active: cleared {len(feasible_bases_for_drone)} bases.")
     arrival_prefix = {b: full_arrival_cur[b] for b in visited_bases if b in full_arrival_cur}
 
     # 3. 处理离线事件 (Events)
