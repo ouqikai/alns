@@ -1316,10 +1316,22 @@ def run_decision_epoch(
     all_bases = [i for i, n in enumerate(data_cur.nodes) if n.get('node_type') == 'base']
     if data_cur.central_idx not in all_bases:
         all_bases.append(data_cur.central_idx)
-    route_set_cur = set(full_route_cur)
-    bases_in_plan = [b for b in all_bases if (b in route_set_cur) or (b == data_cur.central_idx)]
-    visited_bases = [b for b in bases_in_plan if full_arrival_cur.get(b, float('inf')) <= decision_time + 1e-9]
-    bases_to_visit = [b for b in bases_in_plan if full_arrival_cur.get(b, float('inf')) > decision_time + 1e-9]
+    # [FIX] 逻辑修正：不再依赖 route_set_cur。
+    # 只要是“物理上未访问”的基站，都应作为未来的候选基站，允许求解器重新将其加入路径。
+    visited_bases = []
+    bases_to_visit = []
+
+    for b in all_bases:
+        # 判断基站是否已访问：看历史到达时间是否 <= 当前决策时间
+        t_arr = full_arrival_cur.get(b, float('inf'))
+
+        if t_arr <= decision_time + 1e-9:
+            visited_bases.append(b)
+        else:
+            # 即使它不在当前路线上(t_arr=inf)，只要还没路过，就属于“未来可访问”
+            bases_to_visit.append(b)
+
+    # 动态阶段不允许从中心仓库再次起飞（除非它作为终点），通常 visited 包含 central
     feasible_bases_for_drone = sorted(set(visited_bases + bases_to_visit))
     # 动态阶段不允许从中心仓库起飞（车已离开）
     if decision_time > 1e-9:

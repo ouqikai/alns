@@ -67,7 +67,7 @@ CFG_A = {
 CFG_D = {
     "NAME": "D_full_structured",
     "PAIRING_MODE": "free",
-    "late_hard": 3.0,  # 建议显式写在 cfg 里（要更严就 0.10）
+    "late_hard": 0.1,  # 建议显式写在 cfg 里（要更严就 0.10）
     "late_hard_delta": 1.0,
     # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
     "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
@@ -658,13 +658,15 @@ def main():
     # ===== 1) 实验输入 =====
     # file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
-    file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
+    # file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
+    file_path = r"D:\代码\ALNS+DL\OR-Tool\100\nodes_100_seed2023_20260113_152036_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\OR-Tool\100\events_100_seed2023_20260113_152036.csv"
     seed = 2025
     cfg = dict(CFG_D)
-    # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
-    cfg["planner"] = "ALNS"
-    cfg["grb_time_limit"] = 30  # 每个决策点的 MILP 限时（秒）
+    cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
+    # cfg["planner"] = "ALNS"
+    cfg["grb_time_limit"] = 1800  # 每个决策点的 MILP 限时（秒）
     cfg["grb_mip_gap"] = 0.00  # 可选
     cfg["grb_verbose"] = 0  # 可选：0 安静，1 输出更多
     cfg["trace_converge"] = True
