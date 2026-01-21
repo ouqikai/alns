@@ -1703,8 +1703,14 @@ def run_decision_epoch(
     C_boundary = set(cand_boundary[:6])
 
     # 9.4 初始解分类 (Classify / Warm-start)
-    use_preplan = (qf_route_full is not None) and (qf_b2d_full is not None) and (qf_eval_preplan is not None)
+    _is_truck_only = bool(ab_cfg.get("force_truck_mode", False))
 
+    # [DEBUG] 强制打印，确认开关是否生效
+    if verbose:
+        print(f"    [DEBUG] ForceTruckMode={_is_truck_only}")
+
+    use_preplan = (qf_route_full is not None) and (qf_b2d_full is not None) and (qf_eval_preplan is not None) and (
+        not _is_truck_only)
     def _extract_suffix_from_full(full_route, prefix_route, start_idx, data):
         # 中文注释：从“包含前缀”的 full_route 中取出本轮要优化的 suffix，并用 start_idx 作为起点
         if not full_route:
@@ -2001,7 +2007,7 @@ def run_decision_epoch(
         # 走 ALNS（你原代码不动）
         # -----------------------
         (route_next, b2d_next, alns_suffix_cost, _, _, alns_suffix_late, _) = alns_truck_drone(
-            data_next, base_to_drone_next, max_iter=1000,
+            data_next, base_to_drone_next, max_iter=10000,
             remove_fraction=remove_fraction_cfg, T_start=sa_T_start, T_end=sa_T_end, alpha_drone=0.3, lambda_late=50.0,
             truck_customers=truck_next, use_rl=False,
             start_idx=start_idx_for_alns, start_time=decision_time, bases_to_visit=bases_to_visit,
@@ -2115,7 +2121,32 @@ def run_decision_epoch(
         alpha_drone=0.3, lambda_late=50.0,
         truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
     )
+    # ================= [新增诊断打印] =================
+    if verbose and (qf_eval_preplan is not None):
+        # 获取 ALNS 跑完后的成本
+        cost_alns = float(full_eval.get("cost", 0.0))
+        # 获取 Greedy (Preplan) 的原始成本
+        cost_greedy = float(qf_eval_preplan.get("cost", qf_eval_preplan.get("cost(obj)", 0.0)))
+
+        diff = cost_alns - cost_greedy
+
+        print(f"    [COMPARE-INTERNAL] ALNS={cost_alns:.4f} vs Greedy={cost_greedy:.4f} | Diff={diff:.4f}")
+
+        if abs(diff) < 1e-6:
+            print("    [ANALYSIS] ALNS 完全没有改动初始解（可能是迭代次数太少，或初始解已是局部最优）")
+        elif diff > 0:
+            print("    [ANALYSIS] ALNS 跑输了！结果比贪婪还差（稍后可能会触发回滚）")
+        else:
+            print("    [ANALYSIS] ALNS 赢了！找到了更优解")
+    # ================================================
+    # [FIX] TruckOnly 模式下，禁止回滚到 QuickFilter 生成的（可能含无人机的）预案
+    if bool(ab_cfg.get("force_truck_mode", False)):
+        qf_eval_preplan = None
     # 13.x 事后复核：若 ALNS 把 preplan 做坏了则回滚（保证“决策阈值”最终仍成立）
+    if _is_truck_only:
+        qf_eval_preplan = None
+        qf_route_full = None
+        qf_b2d_full = None
     if (qf_eval_preplan is not None) and (qf_route_full is not None) and (qf_b2d_full is not None):
         eps = float(ab_cfg.get("postcheck_eps", 1e-6))
         # 注意：下面字段名按你 evaluate_full_system 的实际 key 来改（你现在汇总表里有 cost(obj)、total_late）

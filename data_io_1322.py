@@ -254,6 +254,6 @@ def read_data(
     for node in data.nodes:
         if node["node_type"] == "customer":
             coord_stats[node.get("coord_source", "UNKNOWN")] = coord_stats.get(node.get("coord_source", "UNKNOWN"), 0) + 1
-    print(f"场景{scenario}坐标使用统计: {coord_stats}")
+    # print(f"场景{scenario}坐标使用统计: {coord_stats}")
 
     return data

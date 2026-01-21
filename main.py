@@ -152,7 +152,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
     try:
         ab_cfg.setdefault("dbg_alns", bool(DBG_ALNS))
         ab_cfg.setdefault("dbg_every", int(DBG_EVERY))
-        ab_cfg.setdefault("dbg_planner_sets", True)  # 中文注释：打印 ALNS/GRB 输入集合核对
+        ab_cfg.setdefault("dbg_planner_sets", False)  # 中文注释：打印 ALNS/GRB 输入集合核对
     except Exception:
         pass
     # ===================== 1) 读取数据（场景0：全原始坐标）=====================
@@ -194,7 +194,16 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         if verbose:
             print(f"[OFFLINE] decision times overridden by events: T=1..{len(perturbation_times)}")
     # ===================== 2) 初始分类（场景0）=====================
-    base_to_drone_customers, truck_customers = sim.classify_clients_for_drone(data)
+    # [FIX] 纯卡车模式拦截：若是 TruckOnly，强制清空无人机客户，全部分给卡车
+    if bool(ab_cfg.get("force_truck_mode", False)):
+        base_to_drone_customers = {}
+        truck_customers = list(getattr(data, "customer_indices", []))
+        bases_visit_0 = []  # 也不强制访问基站
+        if verbose:
+            print("[SCENE 0] Force Truck Mode: Initial solution set to Truck-Only.")
+    else:
+        base_to_drone_customers, truck_customers = sim.classify_clients_for_drone(data)
+        bases_visit_0 = None  # 默认逻辑（None=所有基站）
     if verbose:
         print("需要卡车服务的客户数:", len(truck_customers))
         print("各基站无人机客户数:", {b: len(cs) for b, cs in base_to_drone_customers.items()})
@@ -243,6 +252,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         use_rl=False,
         rl_tau=0.5,
         rl_eta=0.1,
+        bases_to_visit=bases_visit_0,
         ctx=ctx0
     )
 
@@ -493,7 +503,7 @@ def run_compare_suite(
     cfg_greedy = dict(base_cfg)
     cfg_greedy.update({
         "name": "Baseline_Greedy",
-        "method": "Greedy"  # 对应 dynamic_logic 里 G1 的逻辑
+        "method": "G1"  # 对应 dynamic_logic 里 G1 的逻辑
     })
 
     # -----------------------------------------------
@@ -694,12 +704,12 @@ def main():
     print("[BOOT]", __file__, "DEBUG_LATE=", DEBUG_LATE, "DEBUG_LATE_SCENES=", DEBUG_LATE_SCENES)
 
     # ===== 1) 实验输入 =====
-    file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
-    # file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
-    # events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
-    # file_path = r"D:\代码\ALNS+DL\OR-Tool\100\nodes_100_seed2023_20260113_152036_promise.csv"
-    # events_path = r"D:\代码\ALNS+DL\OR-Tool\100\events_100_seed2023_20260113_152036.csv"
+    # file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
+    file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
+    file_path = r"D:\代码\ALNS+DL\OR-Tool\100\nodes_100_seed2023_20260113_152036_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\OR-Tool\100\events_100_seed2023_20260113_152036.csv"
     seed = 2025
     cfg = dict(CFG_D)
     # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
@@ -737,7 +747,7 @@ def main():
     RUN_ROAD_SANITY = False
 
     # 3.4 对照组套件：G0–G3（动态对比）
-    RUN_COMPARE_SUITE = True
+    RUN_COMPARE_SUITE = False
 
     # ===== 4) road sanity =====
     if RUN_ROAD_SANITY:
@@ -808,12 +818,9 @@ def main():
             events_path=events_path,
             out_dir='outputs',
             enable_plot=False,
-            verbose=False
+            verbose=True
         )
         return
-
-
-    
     # ===== 7) 正常动态运行（你平时跑的模式）=====
 
     results = run_one(
