@@ -67,11 +67,11 @@ CFG_A = {
 CFG_D = {
     "NAME": "D_full_structured",
     "PAIRING_MODE": "free",
-    "late_hard": 0.1,  # 建议显式写在 cfg 里（要更严就 0.10）
+    "late_hard": 0.5,  # 建议显式写在 cfg 里（要更严就 0.10）
     "late_hard_delta": 1.0,
     # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
     "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
-    "qf_late_max": 0.3,   # 决策阶段：接受请求的Δlate上限（小时）
+    "qf_late_max": 1.0,   # 决策阶段：接受请求的Δlate上限（小时）
 
     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
     "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
