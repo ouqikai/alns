@@ -10,7 +10,7 @@ from data_io_1322 import recompute_cost_and_nearest_base # 依赖这个重算距
 import operators as ops
 import pandas as pd
 import milp_solver as grb   # 你把 01162113.py 复制改名后的模块
-
+import time
 # === 补充 dprint 定义 ===
 DEBUG = False  # 如果你想看详细调试信息，改成 True
 
@@ -1287,7 +1287,7 @@ def run_decision_epoch(
 
     返回一个字典，包含更新后的状态、日志行、统计结果以及画图所需的数据包。
     """
-
+    t_start_total = time.time()  # <--- [计时开始]
     # 0. 随机种子同步
     if seed is not None:
         ut.set_seed(int(seed) + int(scene_idx))
@@ -1534,10 +1534,11 @@ def run_decision_epoch(
             alpha_drone=0.3, lambda_late=50.0,
             truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
         )
+        solver_time = time.time() - t_start_total
         stat_record = ut._pack_scene_record(
             scene_idx, decision_time, full_eval_g0,
             num_req=num_req, num_acc=num_acc, num_rej=num_rej,
-            alpha_drone=0.3, lambda_late=50.0
+            alpha_drone=0.3, lambda_late=50.0, solver_time=solver_time
         )
         return {
             'break': False,
@@ -1589,10 +1590,32 @@ def run_decision_epoch(
             alpha_drone=0.3, lambda_late=50.0,
             truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
         )
+        solver_time = time.time() - t_start_total
+        # 【修改2】新增：为 Greedy 单独生成一个单行收敛文件（用于画水平基准线）
+        if bool(ab_cfg.get("trace_converge", False)):
+            trace_dir = str(ab_cfg.get("trace_dir", "outputs"))
+            os.makedirs(trace_dir, exist_ok=True)
+            g1_csv = os.path.join(trace_dir, f"converge_Greedy_seed{seed}_scene{scene_idx}.csv")
+            with open(g1_csv, 'w', newline='', encoding='utf-8') as f:
+                w = csv.DictWriter(f, fieldnames=["iter", "best_cost_dist", "best_total_late", "best_truck_dist",
+                                                  "best_drone_dist"])
+                w.writeheader()
+                # 只有第 0 代（初始/最终状态）
+                w.writerow({
+                    "iter": 0,
+                    "best_cost_dist": float(
+                        full_eval_g1.get("truck_dist_eff", full_eval_g1["truck_dist"])) + 0.3 * float(
+                        full_eval_g1["drone_dist"]),
+                    "best_total_late": float(full_eval_g1["total_late"]),
+                    "best_truck_dist": float(full_eval_g1["truck_dist"]),
+                    "best_drone_dist": float(full_eval_g1["drone_dist"]),
+                })
+        if verbose:
+            print(f"    [RUNTIME] {method} QuickFilter+Repair: {solver_time:.3f} s")
         stat_record = ut._pack_scene_record(
             scene_idx, decision_time, full_eval_g1,
             num_req=num_req, num_acc=num_acc, num_rej=num_rej,
-            alpha_drone=0.3, lambda_late=50.0
+            alpha_drone=0.3, lambda_late=50.0, solver_time=solver_time
         )
         return {
             'break': False,
@@ -1628,11 +1651,13 @@ def run_decision_epoch(
             alpha_drone=0.3, lambda_late=50.0,
             truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
         )
-
+        solver_time = time.time() - t_start_total
+        if verbose:
+            print(f"    [RUNTIME] Skip Replan: {solver_time:.3f} s")
         stat_record = ut._pack_scene_record(
             scene_idx, decision_time, full_eval_skip,
             num_req=num_req, num_acc=num_acc, num_rej=num_rej,
-            alpha_drone=0.3, lambda_late=50.0
+            alpha_drone=0.3, lambda_late=50.0, solver_time=solver_time
         )
 
         return {
@@ -1841,10 +1866,11 @@ def run_decision_epoch(
         "arrival_prefix": arrival_prefix, "init_route": init_route,
         "dbg_postcheck": bool(ab_cfg.get("dbg_postcheck", False)),
     })
-    # ===================== 收敛曲线开关/路径（仅对 ALNS 组生效） =====================
-    # 默认关闭；在 ab_cfg 里设置 trace_converge=True 才会写出 converge_*.csv
+    # ===================== 收敛曲线开关/路径 =====================
     trace_on = bool(ab_cfg.get("trace_converge", False))
-    if trace_on and (method in ("G2", "G3")):
+
+    # 【修改1】放开限制：只要开启了 trace_on，所有进入 ALNS 的算法（包括 TruckOnly）都要记录
+    if trace_on:
         trace_dir = str(ab_cfg.get("trace_dir", "outputs"))
         try:
             os.makedirs(trace_dir, exist_ok=True)
@@ -1855,7 +1881,8 @@ def run_decision_epoch(
     else:
         ctx_for_alns["trace_converge"] = False
         ctx_for_alns["trace_csv_path"] = None
-
+    t_solve_start = time.time()
+    solver_val = 0.0
     if planner in ("GRB", "GUROBI"):
         # -----------------------
         # 走 Gurobi：滚动重规划后缀
@@ -1947,22 +1974,8 @@ def run_decision_epoch(
             start_node=int(start_idx_for_alns),
             start_time_h=float(decision_time),
         )
-        print("[GRB-DBG] allowed_bases=", sorted(list(allowed_bases_grb)))
-        print("[GRB-DBG] visited_drone_bases=", sorted(list(visited_bases_grb)))
-        print("[GRB-DBG] drone_assign_total=", sum(len(v) for v in (res.get("drone_assign") or {}).values()),
-              " keys=", list((res.get("drone_assign") or {}).keys())[:5])
-        if bool(ab_cfg.get("dbg_planner_sets", True)):
-            print(f"[PLANNER-SETS][AFTER-GRB] sol_count={int(res.get('sol_count', 0))} gap={res.get('mip_gap', None)} obj={res.get('obj', None)}")
-            # GRB 的输入集合
-            print(f"[PLANNER-SETS][AFTER-GRB] df_sub_rows={len(df_sub)} allowed_bases(n)={len(allowed_bases_grb)} force_truck(n)={len(ft)}")
-            # GRB 的输出解结构
-            try:
-                r = res.get("route", [])
-                da = res.get("drone_assign", {}) or {}
-                print(f"[PLANNER-SETS][AFTER-GRB] route_len={len(r)} route_head={r[:10]} route_tail={r[-10:] if len(r)>10 else r}")
-                print(f"[PLANNER-SETS][AFTER-GRB] drone_assign_bases={sorted(list(da.keys()))} total_drone_customers={sum(len(v) for v in da.values())}")
-            except Exception as e:
-                print("[PLANNER-SETS][AFTER-GRB] parse error:", e)
+        # 获取 Gurobi 内部记录的 Runtime
+        solver_val = res.get("runtime_sec", 0.0)
 
         alpha = float(ab_cfg.get("alpha_drone", 0.3))
         lam = float(ab_cfg.get("lambda_late", 50.0))
@@ -2007,12 +2020,13 @@ def run_decision_epoch(
         # 走 ALNS（你原代码不动）
         # -----------------------
         (route_next, b2d_next, alns_suffix_cost, _, _, alns_suffix_late, _) = alns_truck_drone(
-            data_next, base_to_drone_next, max_iter=10000,
+            data_next, base_to_drone_next, max_iter=1000,
             remove_fraction=remove_fraction_cfg, T_start=sa_T_start, T_end=sa_T_end, alpha_drone=0.3, lambda_late=50.0,
             truck_customers=truck_next, use_rl=False,
             start_idx=start_idx_for_alns, start_time=decision_time, bases_to_visit=bases_to_visit,
             ctx=ctx_for_alns
         )
+        solver_val = time.time() - t_solve_start
         if bool(ab_cfg.get("dbg_planner_sets", True)):
             print(f"[PLANNER-SETS][AFTER-ALNS] suffix_cost={alns_suffix_cost:.3f} suffix_late={alns_suffix_late:.3f}")
             print(f"[PLANNER-SETS][AFTER-ALNS] route_len={len(route_next)} route_head={route_next[:10]} route_tail={route_next[-10:] if len(route_next)>10 else route_next}")
@@ -2268,7 +2282,7 @@ def run_decision_epoch(
     stat_record = ut._pack_scene_record(
         scene_idx, decision_time, full_eval,
         num_req=num_req, num_acc=num_acc, num_rej=num_rej,
-        alpha_drone=0.3, lambda_late=50.0
+        alpha_drone=0.3, lambda_late=50.0, solver_time=solver_val
     )
 
     return {

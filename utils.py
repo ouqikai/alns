@@ -449,7 +449,7 @@ def emit_scene_late_logs(out_dir: str, scene_idx: int, decision_time: float, dat
     return {"late_prom": late_prom, "late_eff": late_eff, "csv": out_csv}
 
 def _pack_scene_record(scene_idx, t_dec, full_eval, num_req, num_acc, num_rej,
-                       alpha_drone=0.3, lambda_late=50.0):
+                       alpha_drone=0.3, lambda_late=50.0, solver_time=0.0):
     """统一封装动态场景记录行，确保关键指标口径一致。"""
     base_cost = float(full_eval.get("truck_dist_eff", full_eval["truck_dist"]))                 + float(alpha_drone) * float(full_eval["drone_dist"])
     penalty = float(lambda_late) * float(full_eval["total_late"])
@@ -469,12 +469,13 @@ def _pack_scene_record(scene_idx, t_dec, full_eval, num_req, num_acc, num_rej,
         "num_req": int(num_req),
         "num_acc": int(num_acc),
         "num_rej": int(num_rej),
+        "solver_time": float(solver_time)
     }
 
 # ===================== 纯卡车 vs 卡车-无人机（静态距离/成本对比）=====================
 def print_summary_table(scenario_results):
     print("\n===== 动态位置变更场景汇总 =====")
-    print("scene | t_dec | cost(obj) | base_cost | penalty | truck_dist | drone_dist | system_time | total_late | req | acc | rej")
+    print("scene | t_dec | cost(obj) | base_cost | penalty | truck_dist | drone_dist | system_time | total_late | req | acc | rej | runtime")
     for rec in scenario_results:
         base_cost = rec.get("base_cost", None)
         penalty = rec.get("penalty", None)
@@ -488,7 +489,7 @@ def print_summary_table(scenario_results):
             except Exception:
                 penalty = 0.0
                 base_cost = float(rec.get("cost", 0.0))
-
+        run_time = rec.get("solver_time", 0.0)
         print(f"{rec['scene']:5d} | "
               f"{rec['t_dec']:5.2f} | "
               f"{rec['cost']:8.3f} | "
@@ -500,26 +501,8 @@ def print_summary_table(scenario_results):
               f"{rec['total_late']:9.3f} | "
               f"{rec['num_req']:3d} | "
               f"{rec['num_acc']:3d} | "
-                      f"{rec['num_rej']:3d}")
-        # # --- 货币口径（元）：用于论文/对比（不影响 obj 计算） ---
-        # try:
-        #     c_truck_km = float(rec.get("c_truck_km", 1.0))
-        #     alpha = float(rec.get("alpha_drone", 0.3))
-        #     c_drone_km = float(rec.get("c_drone_km", alpha * c_truck_km))
-        #     truck_km_euclid = float(rec.get("truck_dist", 0.0)) / float(SCALE_KM_PER_UNIT)
-        #     # 关键口径：truck_km 表示“已包含路况系数(绕行)后的实际卡车里程（km）”
-        #     truck_km = truck_km_euclid  # 中文注释：rec['truck_dist'] 已包含路况系数，不要二次乘
-        #     drone_km = float(rec.get("drone_dist", 0.0)) / float(SCALE_KM_PER_UNIT)
-        #     base_money = c_truck_km * truck_km + c_drone_km * drone_km
-        #     lam = float(rec.get("lambda_late", 50.0))
-        #     penalty_money = lam * float(rec.get("total_late", 0.0))
-        #     cost_money = base_money + penalty_money
-        #     print(
-        #         f"      money: cost={cost_money:.3f} base={base_money:.3f} penalty={penalty_money:.3f} "
-        #         f"(truck_km(road)={truck_km:.3f}, drone_km={drone_km:.3f}, c_truck={c_truck_km:.3f}, c_drone={c_drone_km:.3f})"
-        #     )
-        # except Exception:
-        #     pass
+              f"{rec['num_rej']:3d} | "
+              f"{run_time:11.3f}")
 
 def _print_operator_stats(op_stat: dict, top_k: int = 20):
     """打印 ALNS 算子统计（calls/accepts/sa_reject/late_fail 等），用于验证消融是否真起作用。"""

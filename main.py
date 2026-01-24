@@ -67,11 +67,11 @@ CFG_A = {
 CFG_D = {
     "NAME": "D_full_structured",
     "PAIRING_MODE": "free",
-    "late_hard": 0.5,  # 建议显式写在 cfg 里（要更严就 0.10）
+    "late_hard": 0.1,  # 建议显式写在 cfg 里（要更严就 0.10）
     "late_hard_delta": 1.0,
     # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
     "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
-    "qf_late_max": 1.0,   # 决策阶段：接受请求的Δlate上限（小时）
+    "qf_late_max": 0.3,   # 决策阶段：接受请求的Δlate上限（小时）
 
     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
     "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
@@ -207,7 +207,6 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
     if verbose:
         print("需要卡车服务的客户数:", len(truck_customers))
         print("各基站无人机客户数:", {b: len(cs) for b, cs in base_to_drone_customers.items()})
-
     # ===================== 3) 场景0：跑一次 ALNS（No-RL）=====================
     if verbose:
         print("\n===== Advanced ALNS (No RL, official solution) =====")
@@ -220,19 +219,45 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
     # [PROMISE] 场景0不计迟到：避免 late_hard 护栏误伤（即使你实验配置里开启了 late_hard）
     ctx0["late_hard"] = 1e18
     ctx0["late_hard_delta"] = 1e18
-    # ===================== 收敛曲线（A）可选：scene0 也输出 converge_*.csv =====================
+
+    # 提前获取算法类型，用于下面的判断
+    method_name = ab_cfg.get("method", "G3")
+    is_truck_only = bool(ab_cfg.get("force_truck_mode", False))
+    is_promise_file = ut._is_promise_nodes_file(file_path)
+
+    # ===================== 【修改点】收敛曲线：scene0 也输出 converge_*.csv =====================
     try:
-        if bool(ab_cfg.get("trace_converge", False)) and bool(ab_cfg.get("trace_scene0", False)):
+        # 这里统一用 ab_cfg.get("trace_converge") 总开关
+        if bool(ab_cfg.get("trace_converge", False)):
             trace_dir = str(ab_cfg.get("trace_dir", "outputs"))
             os.makedirs(trace_dir, exist_ok=True)
-            base_name = os.path.splitext(os.path.basename(file_path))[0]
-            method = str(ab_cfg.get("method", ab_cfg.get("compare_group", "G3")))
             ctx0["trace_converge"] = True
-            ctx0["trace_csv_path"] = os.path.join(trace_dir, f"converge_{method}_seed{seed}_scene0.csv")
+
+            # 【修复】：正确区分 G3 和 TruckOnly 的文件名，防止互相覆盖
+            file_method_name = "TruckOnly" if is_truck_only else method_name
+            ctx0["trace_csv_path"] = os.path.join(trace_dir, f"converge_{file_method_name}_seed{seed}_scene0.csv")
         else:
             ctx0["trace_converge"] = False
+            ctx0["trace_csv_path"] = None
     except Exception:
         ctx0["trace_converge"] = False
+        ctx0["trace_csv_path"] = None
+    # =========================================================================================
+
+    # 【默认值】：对所有算法（Greedy, TruckOnly, 以及未来你加的任何对比算法），默认不惩罚
+    lambda_scene0 = 0.0
+
+    # 【特权判断】：只对“完全体 ALNS”施加约束
+    if is_promise_file and (method_name == "G3") and (not is_truck_only):
+        lambda_scene0 = 50.0
+        if verbose:
+            print("    [Scene 0] PROPOSED ALNS (Main): Enforcing promise windows (lambda=50).")
+    else:
+        if verbose:
+            print(
+                f"    [Scene 0] Baseline/Other ({method_name}, TruckOnly={is_truck_only}): Ignoring promise (lambda=0).")
+    # -----------------------------------------------------------
+    t0_start = time.time()
     (best_route,
      best_b2d,
      best_cost,
@@ -247,7 +272,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         T_start=float(ab_cfg.get("sa_T_start", ab_cfg.get("T_start", 50.0))),
         T_end=float(ab_cfg.get("sa_T_end", ab_cfg.get("T_end", 1.0))),
         alpha_drone=0.3,
-        lambda_late=0.0,
+        lambda_late=lambda_scene0,
         truck_customers=truck_customers,
         use_rl=False,
         rl_tau=0.5,
@@ -255,7 +280,10 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         bases_to_visit=bases_visit_0,
         ctx=ctx0
     )
-
+    t0_end = time.time()
+    scene0_runtime = t0_end - t0_start
+    if verbose:
+        print(f"    [SCENE 0] Runtime={scene0_runtime:.3f} s")
     arrival_times, total_time, total_late = sim.compute_truck_schedule(
         data, best_route, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
     )
@@ -316,7 +344,24 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         alpha_drone=0.3, lambda_late=0.0,
         truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
     )
-
+    # ===================== 【新增：专门为 Greedy 补齐 Scene 0 记录】 =====================
+    if bool(ab_cfg.get("trace_converge", False)) and ab_cfg.get("method", "G3") == "G1":
+        import csv
+        trace_dir = str(ab_cfg.get("trace_dir", "outputs"))
+        os.makedirs(trace_dir, exist_ok=True)
+        g1_scene0_csv = os.path.join(trace_dir, f"converge_G1_seed{seed}_scene0.csv")
+        with open(g1_scene0_csv, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=["iter", "best_cost_dist", "best_total_late", "best_truck_dist",
+                                              "best_drone_dist"])
+            w.writeheader()
+            w.writerow({
+                "iter": 0,
+                "best_cost_dist": float(full_eval0.get("truck_dist_eff", full_eval0["truck_dist"])) + 0.3 * float(
+                    full_eval0["drone_dist"]),
+                "best_total_late": float(full_eval0["total_late"]),
+                "best_truck_dist": float(full_eval0["truck_dist"]),
+                "best_drone_dist": float(full_eval0["drone_dist"]),
+            })
     # [PROMISE] 场景0：输出 late_prom/late_eff（late_eff 以冻结窗为准）
     _late_dir = (os.path.join(os.path.dirname(decision_log_path) or ".", "late_logs") if decision_log_path else "")
     ut.emit_scene_late_logs(_late_dir, scene_idx=0, decision_time=0.0, data=data, full_route=best_route, full_b2d=best_b2d, full_eval=full_eval0, prefix="", drone_speed=sim.DRONE_SPEED_UNITS)
@@ -326,7 +371,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         # 如需查看 TopK 迟到客户，请查 late_logs/*.csv（emit_scene_late_logs 会写出）。
         pass
 
-    scenario_results.append(ut._pack_scene_record(0, 0.0, full_eval0, num_req=0, num_acc=0, num_rej=0, alpha_drone=0.3, lambda_late=50.0))
+    scenario_results.append(ut._pack_scene_record(0, 0.0, full_eval0, num_req=0, num_acc=0, num_rej=0, alpha_drone=0.3, lambda_late=50.0, solver_time=scene0_runtime))
     global_xlim, global_ylim = compute_global_xlim_ylim(
         data=data,
         reloc_radius=ab_cfg.get("reloc_radius", 0.8),
@@ -706,10 +751,10 @@ def main():
     # ===== 1) 实验输入 =====
     # file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
-    file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
-    file_path = r"D:\代码\ALNS+DL\OR-Tool\100\nodes_100_seed2023_20260113_152036_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\100\events_100_seed2023_20260113_152036.csv"
+    # file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
+    file_path = r"D:\代码\ALNS+DL\nodes_100_seed2023_20260124_144032.csv"
+    events_path = r"D:\代码\ALNS+DL\events_100_seed2023_20260124_144032.csv"
     seed = 2025
     cfg = dict(CFG_D)
     # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
