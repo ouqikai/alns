@@ -3,41 +3,56 @@ import random
 import math
 import simulation as sim
 
-
 # =========================================================
-# 调试辅助（由 dynamic_logic.alns_truck_drone 透传 ctx）
+# 工具函数：保护节点 / 可复现采样 / 统一读取 ctx 里的集合
 # =========================================================
-def _dbg_should_print(ctx: dict) -> bool:
-    """中文注释：仅在 dbg_alns=True 且命中节流条件时打印。"""
-    try:
-        if not bool(ctx.get("dbg_alns", False)):
-            return False
-        it = int(ctx.get("_dbg_it", 0))
-        every = max(1, int(ctx.get("_dbg_every", 50)))
-        return (it == 1) or (it % every == 0)
-    except Exception:
-        return False
 
+_WARN_ONCE = set()
 
-def _dbg_repair_summary(data, route, b2d, ctx, tag: str):
-    if not _dbg_should_print(ctx):
+def _warn_once(tag: str, msg: str):
+    if tag in _WARN_ONCE:
         return
-    try:
-        cust_set = set(getattr(data, "customer_indices", []))
-        truck_set = {int(c) for c in route if int(c) in cust_set}
-        drone_set = set()
-        for _b, _cs in (b2d or {}).items():
-            for _c in _cs:
-                drone_set.add(int(_c))
-        removed_n = int(ctx.get("num_remove", 0))
-        dname = str(ctx.get("_dbg_d_name", ""))
-        rname = str(ctx.get("_dbg_r_name", ""))
-        print(f"[DBG-REPAIR] it={ctx.get('_dbg_it')} D={dname} R={rname} {tag}: "
-              f"truck={len(truck_set)} drone={len(drone_set)} removed_req={removed_n}")
-    except Exception:
-        pass
+    _WARN_ONCE.add(tag)
+    print(msg)
 
+def _get_protected_nodes(ctx, data):
+    """统一构造 protected_nodes。默认额外保护所有 base 节点，避免 destroy 误删基站。"""
+    protected = set(ctx.get("protected_nodes", set()))
+    if ctx.get("auto_protect_bases", True):
+        try:
+            for i, nd in enumerate(getattr(data, "nodes", [])):
+                if isinstance(nd, dict) and nd.get("node_type") == "base":
+                    protected.add(i)
+        except Exception:
+            pass
+    return protected
 
+def _as_set(ctx, *keys):
+    """把 ctx 中多个候选 key 的集合合并成 set（不存在则忽略）。"""
+    out = set()
+    for k in keys:
+        v = ctx.get(k, None)
+        if v:
+            out |= set(v)
+    return out
+
+def _sorted_if(lst, ctx):
+    """当 deterministic_order=True 时，对列表排序，避免 set 遍历顺序导致同 seed 不稳定。"""
+    if ctx.get("deterministic_order", False):
+        try:
+            return sorted(lst)
+        except Exception:
+            return list(lst)
+    return list(lst)
+
+def _sample(pop, k, ctx):
+    """可复现采样：deterministic_order=True 时，先排序再 sample。"""
+    pop2 = _sorted_if(pop, ctx)
+    if k <= 0:
+        return []
+    if k >= len(pop2):
+        return pop2[:]
+    return random.sample(pop2, k)
 # =========================================================
 # 基础插入/移除原语 (Primitives)
 # =========================================================
@@ -177,53 +192,84 @@ def regret_insert(data, destroyed_route, removed_nodes):
 # =========================================================
 
 def D_random_route(data, route, b2d, ctx):
-    num_remove = ctx["num_remove"]
-    protected = ctx.get("protected_nodes", set())
+    """通用随机破坏：随机移除 route 内若干客户（默认不动基站）。"""
+    num_remove = int(ctx.get("num_remove", 1))
+    protected = _get_protected_nodes(ctx, data)
     destroyed_route, removed = random_removal(route, num_remove, data, protected=protected)
     destroyed_b2d = {b: lst[:] for b, lst in b2d.items()}
     return destroyed_route, destroyed_b2d, removed
 
-
 def D_worst_route(data, route, b2d, ctx):
-    num_remove = ctx["num_remove"]
-    protected = ctx.get("protected_nodes", set())
+    """通用成本导向破坏：移除对卡车距离贡献最大的若干客户（默认不动基站）。"""
+    num_remove = int(ctx.get("num_remove", 1))
+    protected = _get_protected_nodes(ctx, data)
     destroyed_route, removed = worst_removal(route, num_remove, data, protected=protected)
     destroyed_b2d = {b: lst[:] for b, lst in b2d.items()}
     return destroyed_route, destroyed_b2d, removed
 
-
 def D_reloc_focus_v2(data, route, b2d, ctx):
+    """
+    面向“客户位置变更”的聚焦破坏（建议作为主力 destroy）：
+    - 优先拔“变更被拒绝 / 强制卡车 / 边界敏感”客户（更有利于提高接纳率）
+    - 其次少量拔已接受变更客户（用于局部重排，避免被早期决策锁死）
+    - 可选：当你同时启用 D_switch_coverage 时，可排除“明显可切换基站”的客户，降低功能重叠
+    """
     num_remove = int(ctx.get("num_remove", 1))
-    protected = set(ctx.get("protected_nodes", set()))
+    protected = _get_protected_nodes(ctx, data)
 
-    moved_acc = set(ctx.get("C_moved_accept", set()))
-    moved_rej = set(ctx.get("C_moved_reject", set()))
-    force_set = set(ctx.get("C_force_truck", set()))
-    boundary = set(ctx.get("C_boundary", set()))
+    # 统一读取集合（兼容旧 key）
+    moved_acc = _as_set(ctx, "C_moved_accept")
+    moved_rej = _as_set(ctx, "C_moved_reject")
+    force_set = _as_set(ctx, "C_force_truck", "force_truck_set")
+    boundary = _as_set(ctx, "C_boundary")
 
-    pool_main = (moved_acc | force_set | boundary)
-    pool_rej = moved_rej - pool_main
+    # 默认策略：先处理“难点”（rej/force/boundary），再少量处理 acc
+    mode = ctx.get("reloc_focus_mode", "rej_first")
+    if mode == "orig":
+        pool_main = (moved_acc | force_set | boundary)
+        pool_soft = (moved_rej - pool_main)
+    else:
+        pool_main = (moved_rej | force_set | boundary)
+        pool_soft = (moved_acc - pool_main)
 
     def is_removable(i):
-        return (0 <= i < len(data.nodes)
-                and data.nodes[i].get("node_type") == "customer"
-                and i not in protected)
+        return (0 <= int(i) < len(data.nodes)
+                and data.nodes[int(i)].get("node_type") == "customer"
+                and int(i) not in protected)
 
-    pool_main = [i for i in pool_main if is_removable(i)]
-    pool_rej = [i for i in pool_rej if is_removable(i)]
+    pool_main = [int(i) for i in pool_main if is_removable(i)]
+    pool_soft = [int(i) for i in pool_soft if is_removable(i)]
+
+    # 可选：降低与 D_switch_coverage 的重叠——把“明显可切换基站”的客户从 pool_soft 中排除
+    if ctx.get("reloc_focus_exclude_switchable", True) and ctx.get("use_switch_coverage_destroy", True):
+        bases_to_visit = ctx.get("bases_to_visit", [])
+        drone_range = ctx.get("drone_range", sim.DRONE_RANGE_UNITS)
+        route_set = set(route)
+        def _switchable(cid: int) -> bool:
+            try:
+                feas = sim.feasible_bases_for_customer(data, cid, ctx, route_set, drone_range)
+                lockb = data.nodes[cid].get("base_lock", None)
+                if lockb is not None:
+                    feas = [b for b in feas if b == lockb]
+                return len(feas) > 0
+            except Exception:
+                return False
+        # 只排除 soft（主要是 moved_acc/boundary），避免把 moved_rej 的“难点”误排除
+        pool_soft = [cid for cid in pool_soft if not _switchable(cid)]
 
     removed = []
-
     if pool_main:
         take = min(num_remove, len(pool_main))
-        removed.extend(random.sample(pool_main, take))
+        removed.extend(_sample(pool_main, take, ctx))
 
-    if len(removed) < num_remove and pool_rej:
+    # soft 只补一点点，避免过度重排已较稳定的部分
+    if len(removed) < num_remove and pool_soft:
         need = num_remove - len(removed)
         cap = max(1, num_remove // 3)
-        take = min(need, cap, len(pool_rej))
-        removed.extend(random.sample(pool_rej, take))
+        take = min(need, cap, len(pool_soft))
+        removed.extend(_sample(pool_soft, take, ctx))
 
+    # 邻居增强：把被拔客户附近的一个邻居也考虑进来，提升局部重排效果
     route_pos = {node: idx for idx, node in enumerate(route)}
     extra = []
     for c in list(removed):
@@ -233,71 +279,125 @@ def D_reloc_focus_v2(data, route, b2d, ctx):
         for nb in [route[j - 1] if j - 1 >= 0 else None, route[j + 1] if j + 1 < len(route) else None]:
             if nb is None:
                 continue
+            nb = int(nb)
             if is_removable(nb) and nb not in removed and nb not in extra:
                 extra.append(nb)
 
-    random.shuffle(extra)
+    extra = _sorted_if(extra, ctx)
+    random.shuffle(extra)  # 保留一定随机性
     for nb in extra:
         if len(removed) >= num_remove:
             break
         removed.append(nb)
 
+    # 兜底：不够就从 route 内补
     if len(removed) < num_remove:
-        inner = [i for i in route[1:-1] if is_removable(i) and i not in removed]
+        inner = [int(i) for i in route[1:-1] if is_removable(i) and int(i) not in set(removed)]
         need = num_remove - len(removed)
         if inner:
-            removed += random.sample(inner, min(need, len(inner)))
+            removed += _sample(inner, min(need, len(inner)), ctx)
 
     removed_set = set(removed)
     destroyed_route = [x for x in route if x not in removed_set]
     destroyed_b2d = {b: [c for c in lst if c not in removed_set] for b, lst in b2d.items()}
-
     return destroyed_route, destroyed_b2d, removed
 
-
 def D_switch_coverage(data, route, b2d, ctx):
+    """
+    覆盖切换导向破坏（建议作为主力 destroy）：
+    - 只拔“存在可行基站集合”的客户，给 repair 创造 truck↔drone / base-switch 的空间
+    - 与 D_reloc_focus_v2 互补：它更偏“难点客户/边界”，本算子更偏“可切换客户”
+    """
     num_remove = int(ctx.get("num_remove", 1))
-    protected = set(ctx.get("protected_nodes", set()))
-    bases_to_visit = ctx.get("bases_to_visit", [])
-    drone_range = ctx.get("drone_range", None)
-
-    if drone_range is None:
-        # 尝试兜底
-        drone_range = sim.DRONE_RANGE_UNITS
+    protected = _get_protected_nodes(ctx, data)
 
     route_set = set(route)
-    force_set = set(ctx.get("force_truck_set", set()))
+    drone_range = ctx.get("drone_range", sim.DRONE_RANGE_UNITS)
 
-    in_route = {i for i in route if data.nodes[i].get("node_type") == "customer"}
-    in_drone = {c for cs in b2d.values() for c in cs}
+    # 兼容两种 key
+    force_set = _as_set(ctx, "force_truck_set", "C_force_truck")
+
+    in_route = {int(i) for i in route if data.nodes[int(i)].get("node_type") == "customer"}
+    in_drone = {int(c) for cs in b2d.values() for c in cs}
     cand = list((in_route | in_drone) - force_set)
 
-    def ok(i):
+    def ok(i: int) -> bool:
         if i in protected:
             return False
         if data.nodes[i].get("node_type") != "customer":
             return False
-        feas = sim.feasible_bases_for_customer(data, i, ctx, route_set, drone_range)
-        lockb = data.nodes[i].get("base_lock", None)
-        if lockb is not None:
-            feas = [b for b in feas if b == lockb]
-        return len(feas) > 0
+        try:
+            feas = sim.feasible_bases_for_customer(data, i, ctx, route_set, drone_range)
+            lockb = data.nodes[i].get("base_lock", None)
+            if lockb is not None:
+                feas = [b for b in feas if b == lockb]
+            return len(feas) > 0
+        except Exception:
+            return False
 
-    cand = [i for i in cand if ok(i)]
+    cand = [int(i) for i in cand if ok(int(i))]
     if not cand:
         return route[:], {b: lst[:] for b, lst in b2d.items()}, []
 
-    removed = random.sample(cand, min(num_remove, len(cand)))
+    removed = _sample(cand, min(num_remove, len(cand)), ctx)
     removed_set = set(removed)
 
     destroyed_route = [x for x in route if x not in removed_set]
     destroyed_b2d = {b: [c for c in lst if c not in removed_set] for b, lst in b2d.items()}
     return destroyed_route, destroyed_b2d, removed
 
+def D_late_worst(data, route, b2d, ctx):
+    """
+    迟到驱动破坏（建议低频使用）：
+    - 只在“总迟到超过阈值”时才真正按迟到从大到小拔点
+    - 若迟到很小/几乎为 0，则自动退化为 D_worst_route（避免重复追迟到）
+    """
+    num_remove = int(ctx.get("num_remove", 1))
+    protected = _get_protected_nodes(ctx, data)
 
-# =========================================================
-# 无人机修复辅助 & 具体 Repair 算子
-# =========================================================
+    start_time = float(ctx.get("start_time", 0.0))
+    truck_speed = float(ctx.get("truck_speed", sim.TRUCK_SPEED_UNITS))
+    arrival_prefix = ctx.get("arrival_prefix", None)
+
+    # 计算当前卡车路线到达时间
+    arrival_times, _, _ = sim.compute_truck_schedule(data, route, start_time, truck_speed)
+    if arrival_prefix:
+        arrival_times = dict(arrival_times)
+        arrival_times.update(arrival_prefix)
+
+    # 扫描卡车客户迟到
+    late_customers = []
+    total_late = 0.0
+    for idx in route:
+        idx = int(idx)
+        if idx in protected:
+            continue
+        if data.nodes[idx].get("node_type") == "customer":
+            due = float(data.nodes[idx].get("effective_due", data.nodes[idx].get("due_time", float("inf"))))
+            arr = float(arrival_times.get(idx, 0.0))
+            late = max(0.0, arr - due)
+            if late > 1e-9:
+                total_late += late
+                late_customers.append((late, idx))
+
+    trigger = float(ctx.get("LATE_DESTROY_TRIGGER", 1e-6))
+    if total_late <= trigger:
+        # 迟到不严重时，退化为成本导向破坏
+        return D_worst_route(data, route, b2d, ctx)
+
+    late_customers.sort(key=lambda x: x[0], reverse=True)
+    removed = [cid for _, cid in late_customers[:num_remove]]
+
+    # 不够再补一点随机（保持多样性）
+    if len(removed) < num_remove:
+        remaining_inner = [int(x) for x in route[1:-1] if int(x) not in protected and int(x) not in set(removed)]
+        need = num_remove - len(removed)
+        removed.extend(_sample(remaining_inner, min(need, len(remaining_inner)), ctx))
+
+    removed_set = set(removed)
+    destroyed_route = [x for x in route if x not in removed_set]
+    destroyed_b2d = {b: [c for c in lst if c not in removed_set] for b, lst in b2d.items()}
+    return destroyed_route, destroyed_b2d, removed
 
 def drone_repair_feasible(data, route, b2d, ctx, k_moves=5, sample_k=12):
     bases_to_visit = ctx.get("bases_to_visit", [])
@@ -414,64 +514,120 @@ def drone_repair_feasible(data, route, b2d, ctx, k_moves=5, sample_k=12):
 def R_greedy_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
     r = greedy_insert(data, destroyed_route, removed_customers)
     bd = {b: lst[:] for b, lst in destroyed_b2d.items()}
-    _dbg_repair_summary(data, r, bd, ctx, tag="greedy_only")
+
     return r, bd
 
 
 def R_regret_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
     r = regret_insert(data, destroyed_route, removed_customers)
     bd = {b: lst[:] for b, lst in destroyed_b2d.items()}
-    _dbg_repair_summary(data, r, bd, ctx, tag="regret_only")
+
     return r, bd
 
 
 def R_greedy_then_drone(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
+    """先 greedy 插回卡车，再做一次 drone/base 可行修复。"""
     r, bd = R_greedy_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx)
     r, bd = drone_repair_feasible(data, r, bd, ctx, k_moves=8, sample_k=10)
-    _dbg_repair_summary(data, r, bd, ctx, tag="greedy_then_drone")
     return r, bd
-
 
 def R_regret_then_drone(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
+    """主力 repair：先 regret 插回卡车，再做一次 drone/base 可行修复。"""
     r, bd = R_regret_only(data, destroyed_route, destroyed_b2d, removed_customers, ctx)
     r, bd = drone_repair_feasible(data, r, bd, ctx, k_moves=8, sample_k=10)
-    _dbg_repair_summary(data, r, bd, ctx, tag="regret_then_drone")
     return r, bd
 
-
 def R_base_feasible_drone_first(data, destroyed_route, destroyed_b2d, removed_customers, ctx):
-    bases_to_visit = ctx.get("bases_to_visit", [])
-    drone_range = ctx.get("drone_range", None)
-    if drone_range is None:
-        drone_range = sim.DRONE_RANGE_UNITS
+    """
+    无人机优先修复（偏“提高接纳率”）：
+    - removed 客户若存在可行基站，优先分配到无人机
+    - 为了控成本/迟到：支持 base 选择策略
+        ctx['drone_first_pick'] = 'random'（原行为，默认）
+                            或 'min_dist'（选 drone 距离最短）
+                            或 'min_obj'（粗估 alpha*dist + lambda*late，推荐）
+    """
+    drone_range = ctx.get("drone_range", sim.DRONE_RANGE_UNITS)
 
     route = destroyed_route[:]
     b2d = {b: lst[:] for b, lst in destroyed_b2d.items()}
     route_set = set(route)
-    force_set = set(ctx.get("force_truck_set", set()))
+    force_set = _as_set(ctx, "force_truck_set", "C_force_truck")
+
+    pick_mode = ctx.get("drone_first_pick", "random")
+    start_time = float(ctx.get("start_time", 0.0))
+    truck_speed = float(ctx.get("truck_speed", sim.TRUCK_SPEED_UNITS))
+    drone_speed = float(ctx.get("drone_speed", sim.DRONE_SPEED_UNITS))
+    alpha_drone = float(ctx.get("alpha_drone", 0.3))
+    lambda_late = float(ctx.get("lambda_late", 50.0))
+    arrival_prefix = ctx.get("arrival_prefix", None)
+
+    # 预先算一次卡车到达时间（用于 min_obj）
+    arrival_times = None
+    if pick_mode == "min_obj":
+        try:
+            arrival_times, _, _ = sim.compute_truck_schedule(data, route, start_time, truck_speed)
+            if arrival_prefix:
+                arrival_times = dict(arrival_times)
+                arrival_times.update(arrival_prefix)
+        except Exception:
+            arrival_times = None
+
+    def _pick_best_base(cid: int, feas: list):
+        if not feas:
+            return None
+        if pick_mode == "random":
+            return random.choice(feas)
+        if pick_mode == "min_dist":
+            return min(feas, key=lambda b: float(data.costMatrix[int(b)][cid]))
+        # min_obj：粗估 obj = alpha*dist + lambda*late（只看该客户的 late）
+        if arrival_times is None:
+            return min(feas, key=lambda b: float(data.costMatrix[int(b)][cid]))
+        due = float(data.nodes[cid].get("effective_due", data.nodes[cid].get("due_time", float("inf"))))
+        best_b = None
+        best_val = float("inf")
+        for b in feas:
+            b = int(b)
+            t_b = float(arrival_times.get(b, 0.0))
+            d = float(data.costMatrix[b][cid])
+            t_svc = t_b + d / max(1e-9, float(drone_speed))
+            late = max(0.0, t_svc - due)
+            val = alpha_drone * d + lambda_late * late
+            if val < best_val:
+                best_val = val
+                best_b = b
+        return best_b
 
     for cid in removed_customers:
+        cid = int(cid)
         if cid in force_set:
             continue
+
         feas = sim.feasible_bases_for_customer(data, cid, ctx, route_set, drone_range)
         lockb = data.nodes[cid].get("base_lock", None)
         if lockb is not None:
-            feas = [b for b in feas if b == lockb]
+            feas = [b for b in feas if int(b) == int(lockb)]
+
         if feas:
-            b = random.choice(feas)
-            b2d.setdefault(b, [])
-            b2d[b].append(cid)
+            b = _pick_best_base(cid, feas)
+            if b is None:
+                b = int(random.choice(feas))
+            b2d.setdefault(int(b), [])
+            b2d[int(b)].append(cid)
         else:
+            # 兜底：插回卡车
             route = greedy_insert(data, route, [cid])
             route_set = set(route)
+            # route 改了，min_obj 需要刷新 arrival_times
+            if pick_mode == "min_obj":
+                try:
+                    arrival_times, _, _ = sim.compute_truck_schedule(data, route, start_time, truck_speed)
+                    if arrival_prefix:
+                        arrival_times = dict(arrival_times)
+                        arrival_times.update(arrival_prefix)
+                except Exception:
+                    arrival_times = None
 
-    _dbg_repair_summary(data, route, b2d, ctx, tag="base_feasible_drone_first")
     return route, b2d
-
-
-# =========================================================
-# Late Repair (复杂修复)
-# =========================================================
 
 def _late_repair_score_bases_by_drone_lateness(
         data, route, base_to_drone_customers,
@@ -572,10 +728,10 @@ def _late_repair_best_reinsert_position(data, route, base_to_drone_customers, ci
 
 def _late_repair_best_base_reinsert(data, route, base_to_drone_customers, base_idx, ctx):
     start_time = float(ctx.get('start_time', 0.0))
-    truck_speed = float(ctx.get('truck_speed', 1.0))
-    drone_speed = float(ctx.get('drone_speed', 1.0))
+    truck_speed = float(ctx.get('truck_speed', sim.TRUCK_SPEED_UNITS))
+    drone_speed = float(ctx.get('drone_speed', sim.DRONE_SPEED_UNITS))
     alpha_drone = float(ctx.get('alpha_drone', 0.3))
-    lambda_late = float(ctx.get('lambda_late', 0.0))
+    lambda_late = float(ctx.get('lambda_late', 50.0))
     arrival_prefix = ctx.get('arrival_prefix', None)
     eps = float(ctx.get('eps', 1e-9))
 
@@ -638,10 +794,10 @@ def late_repair_truck_reinsert(data, route, base_to_drone_customers, ctx):
     max_moves = int(ctx.get('LATE_REPAIR_MAX_MOVES', 3))
     eps = float(ctx.get('eps', 1e-9))
     start_time = float(ctx.get('start_time', 0.0))
-    truck_speed = float(ctx.get('truck_speed', 1.0))
-    drone_speed = float(ctx.get('drone_speed', 1.0))
+    truck_speed = float(ctx.get('truck_speed', sim.TRUCK_SPEED_UNITS))
+    drone_speed = float(ctx.get('drone_speed', sim.DRONE_SPEED_UNITS))
     alpha_drone = float(ctx.get('alpha_drone', 0.3))
-    lambda_late = float(ctx.get('lambda_late', 0.0))
+    lambda_late = float(ctx.get('lambda_late', 50.0))
     arrival_prefix = ctx.get('arrival_prefix', None)
 
     def _eval(r):
@@ -719,10 +875,35 @@ def late_repair_truck_reinsert(data, route, base_to_drone_customers, ctx):
     return route
 
 def R_late_repair_reinsert(data, route, base_to_drone_customers, removed_customers, ctx):
+    """
+    迟到专项修复（建议低频使用）：
+    - 先走主力 R_regret_then_drone
+    - 仅当当前解仍有明显迟到（> LATE_REPAIR_TRIGGER）时，才触发 late_repair_truck_reinsert
+    """
     res = R_regret_then_drone(data, route, base_to_drone_customers, removed_customers, ctx)
     if res is None:
         return None
     route2, b2d2 = res
+
+    trigger = float(ctx.get("LATE_REPAIR_TRIGGER", 1e-6))
+    # 快速判断是否有迟到（用同一评估口径）
+    try:
+        start_time = float(ctx.get("start_time", 0.0))
+        truck_speed = float(ctx.get("truck_speed", sim.TRUCK_SPEED_UNITS))
+        drone_speed = float(ctx.get("drone_speed", sim.DRONE_SPEED_UNITS))
+        alpha_drone = float(ctx.get("alpha_drone", 0.3))
+        lambda_late = float(ctx.get("lambda_late", 50.0))
+        arrival_prefix = ctx.get("arrival_prefix", None)
+        _, _, _, _, _, total_late, _ = sim.evaluate_truck_drone_with_time(
+            data, route2, b2d2, start_time, truck_speed, drone_speed,
+            alpha_drone, lambda_late, arrival_prefix=arrival_prefix
+        )
+        if float(total_late) <= trigger:
+            return route2, b2d2
+    except Exception:
+        # 若评估失败，则不做 late_repair，保持稳健
+        return route2, b2d2
+
     route3 = late_repair_truck_reinsert(data, route2, b2d2, ctx)
     return route3, b2d2
 
@@ -830,3 +1011,32 @@ def build_ab_cfg(cfg: dict):
         new_cfg["ALLOWED_PAIRS"] = pairs
 
     return new_cfg
+# =========================================================
+# 推荐算子组合（按“高接纳率 + 控成本/迟到”的目标）
+# 说明：真正使用哪些算子由外部 cfg 决定，这里给出建议列表方便配置。
+# =========================================================
+
+RECOMMENDED_DESTROYS = [
+    'D_reloc_focus_v2',
+    'D_switch_coverage',
+    'D_worst_route',
+    # 低频探索：
+    'D_random_route',
+    # 低频控迟到：
+    'D_late_worst',
+]
+
+RECOMMENDED_REPAIRS = [
+    'R_regret_then_drone',
+    'R_base_feasible_drone_first',
+    # 低频控迟到：
+    'R_late_repair_reinsert',
+]
+
+RECOMMENDED_ALLOWED_PAIRS = [
+    ('D_reloc_focus_v2', 'R_regret_then_drone'),
+    ('D_switch_coverage', 'R_base_feasible_drone_first'),
+    ('D_worst_route', 'R_regret_then_drone'),
+    ('D_random_route', 'R_regret_then_drone'),
+    ('D_late_worst', 'R_late_repair_reinsert'),
+]

@@ -504,31 +504,6 @@ def print_summary_table(scenario_results):
               f"{rec['num_rej']:3d} | "
               f"{run_time:11.3f}")
 
-def _print_operator_stats(op_stat: dict, top_k: int = 20):
-    """打印 ALNS 算子统计（calls/accepts/sa_reject/late_fail 等），用于验证消融是否真起作用。"""
-    if not op_stat:
-        print("[ALNS-SUM] op_stat empty")
-        return
-    rows = []
-    for k, s in op_stat.items():
-        calls = int(s.get("calls", 0))
-        acc = int(s.get("accepts", 0))
-        sarej = int(s.get("sa_reject", 0))
-        latef = int(s.get("late_fail", 0))
-        latedf = int(s.get("late_delta_fail", 0))
-        repf = int(s.get("repair_fail", 0))
-        covf = int(s.get("cover_fail", 0))
-        besth = int(s.get("best_hits", 0))
-        bestg = float(s.get("best_gain", 0.0))
-        acc_rate = (acc / calls) if calls > 0 else 0.0
-        best_rate = (besth / calls) if calls > 0 else 0.0
-        rows.append((k, calls, acc, acc_rate, besth, best_rate, sarej, latef, latedf, repf, covf, bestg))
-    rows.sort(key=lambda x: (-x[3], -x[5], -x[11]))
-    print("[ALNS-SUM] op_key | calls acc acc_rate best_hits best_rate sa_rej late_abs_fail late_delta_fail repair_fail cover_fail best_gain")
-    for r in rows[:top_k]:
-        print("  - %s | %4d %4d %.2f %4d %.2f %4d %4d %4d %4d %4d %.3f" %
-              (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]))
-
 def _normalize_perturbation_times(times):
     """规范化决策时刻列表：
     - 过滤 <=0 的时刻（t=0 的初始场景由系统自动包含，避免重复）

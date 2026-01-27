@@ -46,134 +46,6 @@ except Exception:
 def euclid(x1, y1, x2, y2) -> float:
     return math.hypot(x1 - x2, y1 - y2)
 
-
-
-
-def plot_solution(nodes: Dict[int, Dict],
-                  depot: int,
-                  bases: List[int],
-                  customers: List[int],
-                  truck_route: List[int],
-                  drone_assign: Dict[int, List[int]],
-                  out_path: str,
-                  title: str = "Static MILP Truck-Drone Solution",
-                  show: bool = False):
-
-    if plt is None:
-        print("[PLOT] 未安装 matplotlib，跳过可视化。")
-        return
-
-    def _setup_cn_font():
-        # 按优先级依次尝试：微软雅黑 / 黑体 / Arial Unicode（不同机器不一样）
-        plt.rcParams['font.sans-serif'] = [
-            'Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'Noto Sans CJK SC'
-        ]
-        plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
-
-    # 在 plot_solution() 一开始调用一次
-    _setup_cn_font()
-    fig, ax = plt.subplots(figsize=(8, 6), dpi=140)
-
-    # --- 坐标范围（自动 padding + 对齐到 10）---
-    xs = [float(nodes[i]["x"]) for i in nodes.keys()]
-    ys = [float(nodes[i]["y"]) for i in nodes.keys()]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    span = max(max_x - min_x, max_y - min_y, 1.0)
-    pad = max(5.0, 0.05 * span)
-
-    def _round10_floor(v): return math.floor(v / 10.0) * 10.0
-    def _round10_ceil(v): return math.ceil(v / 10.0) * 10.0
-
-    x0 = _round10_floor(min_x - pad)
-    x1 = _round10_ceil(max_x + pad)
-    y0 = _round10_floor(min_y - pad)
-    y1 = _round10_ceil(max_y + pad)
-
-    ax.set_xlim((x0, x1))
-    ax.set_ylim((y0, y1))
-    ax.set_aspect("equal", "box")
-    ax.grid(True, linestyle="--", linewidth=0.6, color="gray", alpha=0.6)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_title(title)
-
-    # --- 服务模式集合 ---
-    drone_customers = set()
-    for b, lst in drone_assign.items():
-        for c in lst:
-            drone_customers.add(c)
-    truck_customers = set(customers) - drone_customers
-
-    # --- 画 central & bases ---
-    cx, cy = nodes[depot]["x"], nodes[depot]["y"]
-    ax.scatter([cx], [cy], marker="s", s=120, c="yellow", edgecolors="black", zorder=6)
-    for b in bases:
-        bx, by = nodes[b]["x"], nodes[b]["y"]
-        ax.scatter([bx], [by], marker="*", s=180, c="yellow", edgecolors="black", zorder=6)
-
-    # --- 画 customers ---
-    if truck_customers:
-        tx = [nodes[c]["x"] for c in truck_customers]
-        ty = [nodes[c]["y"] for c in truck_customers]
-        ax.scatter(tx, ty, facecolors="none", edgecolors="blue", s=35, linewidths=1.6, zorder=5)
-
-    if drone_customers:
-        dx = [nodes[c]["x"] for c in drone_customers]
-        dy = [nodes[c]["y"] for c in drone_customers]
-        ax.scatter(dx, dy, c="blue", s=30, zorder=5)
-
-    # --- 画卡车路径（红线 + 箭头）---
-    # 仅画 route 中相邻边
-    for i in range(len(truck_route) - 1):
-        a = truck_route[i]
-        b = truck_route[i + 1]
-        x1, y1 = nodes[a]["x"], nodes[a]["y"]
-        x2, y2 = nodes[b]["x"], nodes[b]["y"]
-        ax.plot([x1, x2], [y1, y2], color="red", linewidth=1.8, alpha=0.9, zorder=3)
-        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
-                    arrowprops=dict(arrowstyle="-|>", color="red", lw=1.2, alpha=0.9))
-
-    # --- 画无人机分配（浅蓝）---
-    for b, lst in drone_assign.items():
-        bx, by = nodes[b]["x"], nodes[b]["y"]
-        for c in lst:
-            cx, cy = nodes[c]["x"], nodes[c]["y"]
-            ax.plot([bx, cx], [by, cy], color="skyblue", linewidth=1.2, alpha=0.9, zorder=3)
-            ax.annotate("", xy=(cx, cy), xytext=(bx, by),
-                        arrowprops=dict(arrowstyle="-|>", color="skyblue", lw=1.0, alpha=0.9))
-
-    # --- 图例 ---
-    legend_elements = [
-        Line2D([0], [0], marker="s", color="w", markerfacecolor="yellow",
-               markeredgecolor="black", markersize=9, label="中心仓库"),
-        Line2D([0], [0], marker="*", color="w", markerfacecolor="yellow",
-               markeredgecolor="black", markersize=11, label="基站"),
-        Line2D([0], [0], marker="o", color="blue", markerfacecolor="white",
-               markeredgecolor="blue", markersize=7, label="卡车客户"),
-        Line2D([0], [0], marker="o", color="blue", markerfacecolor="blue",
-               markeredgecolor="blue", markersize=7, label="无人机客户"),
-        Line2D([0], [0], color="red", lw=1.8, label="卡车路径"),
-        Line2D([0], [0], color="skyblue", lw=1.2, label="无人机路径"),
-    ]
-    ax.legend(handles=legend_elements, loc="upper left",
-              bbox_to_anchor=(1.02, 1.0), frameon=False, fontsize=9)
-
-    fig.tight_layout()
-
-    if out_path:
-        fig.savefig(out_path, dpi=160)
-        print(f"[PLOT] saved: {out_path}")
-
-    if show:
-        # 如果你希望在 PyCharm 里弹窗显示，把 --plot_show 设为 1
-        try:
-            plt.show()
-        except Exception:
-            pass
-
-    plt.close(fig)
-
 def solve_milp_return_from_df(
         df: pd.DataFrame,
         *,
@@ -679,53 +551,6 @@ def build_and_solve(csv_path: str,
     print("\n[TRUCK] 路线 NODE_ID：", route)
     print("[DRONE] 分配：", drone_assign)
 
-    # 5) 可视化：需要把 nodes/bases/customers/depot 解析出来
-    if int(plot) == 1:
-        out_png = plot_path.strip() if isinstance(plot_path, str) else ""
-        if not out_png:
-            out_png = "milp_solution.png"
-
-        # 解析 nodes / depot / bases / customers
-        nodes: Dict[int, Dict] = {}
-        for _, row in df.iterrows():
-            nid = int(row["NODE_ID"])
-            due_val = row["DUE_TIME"]
-            if "EFFECTIVE_DUE" in df.columns:
-                v = row.get("EFFECTIVE_DUE", None)
-                try:
-                    if v is not None and (not (isinstance(v, float) and math.isnan(v))):
-                        due_val = v
-                except Exception:
-                    pass
-            nodes[nid] = {
-                "type": str(row["NODE_TYPE"]).strip(),
-                "x": float(row["ORIG_X"]),
-                "y": float(row["ORIG_Y"]),
-                "ready": float(row["READY_TIME"]),
-                "due": float(due_val),
-                "demand": float(row["DEMAND"]) if "DEMAND" in df.columns else 0.0
-            }
-
-        depot_list = [nid for nid, nd in nodes.items() if nd["type"] == "central"]
-        if len(depot_list) != 1:
-            print("[PLOT][WARN] central 节点应当且仅当 1 个，实际=", depot_list)
-            return
-        depot = depot_list[0]
-        bases = sorted([nid for nid, nd in nodes.items() if nd["type"] == "base"])
-        customers = sorted([nid for nid, nd in nodes.items() if nd["type"] == "customer"])
-
-        plot_solution(
-            nodes=nodes,
-            depot=depot,
-            bases=bases,
-            customers=customers,
-            truck_route=route,
-            drone_assign=drone_assign,
-            out_path=out_png,
-            title="Static MILP Truck-Drone Solution",
-            show=bool(plot_show),
-        )
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", type=str, required=True, help="输入 CSV 路径")
@@ -779,34 +604,14 @@ INLINE_CFG = dict(
     mip_gap=0.0,
     unit_per_km=5.0,
     verbose=1,
-    plot=1,
-    plot_path=r"D:\代码\ALNS+DL\pic-grb\milp_solution.png",
+    plot=0,
+    plot_path=r"",
     plot_show=1,
 )
 
-def make_plot_path(csv_path: str, out_dir: str, suffix: str = "", ext: str = ".png") -> str:
-    """
-    根据数据集文件名自动生成不覆盖的图片路径：
-    - 从 csv 文件名里提取 nodes/events 的关键信息（如 nodes_25_seed2023...）
-    - 加时间戳避免覆盖
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.basename(csv_path)
-    stem = os.path.splitext(base)[0]  # nodes_25_seed2023_xxx
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = f"{stem}{suffix}_{ts}"
-    return os.path.join(out_dir, f"milp_{tag}{ext}")
-
 if __name__ == "__main__":
     if RUN_WITH_INLINE_CONFIG:
-        out_dir = r"/pic-grb"
-
-        # 自动生成不覆盖的图片名（可额外加 _TL120 或 _gap0p05 之类的后缀）
-        suffix = f"_TL{int(INLINE_CFG['time_limit'])}_gap{INLINE_CFG['mip_gap']}"
-        INLINE_CFG["plot_path"] = make_plot_path(INLINE_CFG["csv_path"], out_dir, suffix=suffix)
-
         build_and_solve(**INLINE_CFG)
-        print("[OUT] plot_path =", INLINE_CFG["plot_path"])
     else:
         main()
 

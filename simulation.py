@@ -339,45 +339,6 @@ def check_disjoint(data, route, base_to_drone_customers):
     if inter:
         print("警告：以下客户同时出现在卡车路径和无人机列表中：", [data.nodes[i]['node_id'] for i in inter])
 
-
-def sanity_check_full(data, full_route, full_b2d):
-    """一致性检查"""
-    all_customers = {i for i, n in enumerate(data.nodes) if n.get('node_type') == 'customer'}
-    truck_set = {i for i in full_route if i in all_customers}
-    drone_list = [c for cs in full_b2d.values() for c in cs]
-    drone_set = set(drone_list)
-    if len(drone_list) != len(drone_set):
-        raise RuntimeError(f"[FULL-check] drone 列表有重复")
-    inter = truck_set & drone_set
-    if inter:
-        raise RuntimeError(f"[FULL-check] truck/drone 客户冲突")
-    covered = truck_set | drone_set
-    if len(covered) > len(all_customers):
-        raise RuntimeError(f"[FULL-check] 覆盖数超过客户总数")
-    return {
-        "n_customers": len(all_customers),
-        "truck_customers": len(truck_set),
-        "drone_customers": len(drone_set),
-        "covered": len(covered),
-    }
-
-def guardrail_check(data, full_route, full_b2d, tag=""):
-    """工程护栏"""
-    all_customers = {i for i, n in enumerate(data.nodes) if n.get("node_type") == "customer"}
-    truck_customers = {i for i in full_route if
-                       0 <= i < len(data.nodes) and data.nodes[i].get("node_type") == "customer"}
-    drone_customers = {c for cs in full_b2d.values() for c in cs}
-
-    covered = truck_customers | drone_customers
-    uncovered = all_customers - covered
-    if uncovered:
-        nids = [data.nodes[i]["node_id"] for i in sorted(uncovered)]
-        raise RuntimeError(f"[GUARDRAIL]{tag} 存在未覆盖客户 uncovered={len(uncovered)} node_id={nids}")
-
-    inter = truck_customers & drone_customers
-    if inter:
-        raise RuntimeError(f"[GUARDRAIL]{tag} 冲突")
-
 # simulation.py (追加在文件末尾)
 
 def feasible_bases_for_customer(data, cid, ctx, route_set, drone_range=None, base_onhand=None):

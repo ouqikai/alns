@@ -11,6 +11,7 @@ import operators as ops
 import pandas as pd
 import milp_solver as grb   # 你把 01162113.py 复制改名后的模块
 import time
+import ga_solver
 # === 补充 dprint 定义 ===
 DEBUG = False  # 如果你想看详细调试信息，改成 True
 
@@ -1033,6 +1034,9 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
               "n_destroy=", len(DESTROYS),
               "n_repair=", len(REPAIRS),
               "scene_idx=", ctx.get("scene_idx", None))
+    # [新增] 早停参数
+    max_no_improve = int(ctx.get("max_no_improve", 200))  # 默认 200 代无改进就停止
+    no_improve_cnt = 0
     hit_stat = {}  # key: destroy_name -> dict(removed=0, hit=0, calls=0)
     op_stat = {}  # destroy -> dict(calls, accepts, best_hits, best_gain)
 
@@ -1203,35 +1207,18 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
 
                 s["best_hits"] += 1
                 s["best_gain"] += gain
+                no_improve_cnt = 0
+            else:
+                # [新增] 没找到全局更优解（哪怕被 SA 接受了也不算），计数器 +1
+                no_improve_cnt += 1
+            # [新增] 检查早停条件
+            if no_improve_cnt >= max_no_improve:
+                if ctx.get("verbose", False):
+                    print(f"    [EARLY-STOP] ALNS 在 {it} 代触发早停 (连续 {max_no_improve} 代无全局改进)")
+                break
         else:
             # 仅统计：SA 没接受（不改变任何决策逻辑）
             s["sa_reject"] += 1
-        # if ctx.get("verbose", False) and it % 200 == 0:
-        #     print("[OP-SUMMARY] it=", it)
-        #     for k, v in sorted(op_stat.items()):
-        #         calls = v.get("calls", 0)
-        #         acc = v.get("accepts", 0)
-        #         latef = v.get("late_fail", 0)
-        #         sarej = v.get("sa_reject", 0)
-        #         besth = v.get("best_hits", 0)
-        #         bestg = v.get("best_gain", 0.0)
-        #         repf = v.get("repair_fail", 0)
-        #         lex = v.get("late_excess", 0.0)
-        #
-        #         acc_rate = acc / max(1, calls)
-        #         late_rate = latef / max(1, calls)
-        #         rep_rate = repf / max(1, calls)
-        #         sa_rate = sarej / max(1, calls)
-        #         best_rate = besth / max(1, calls)
-        #         avg_gain = bestg / max(1, besth)
-        #         avg_late_excess = lex / max(1, latef)
-        #
-        #         print(f"  {k:18s} calls={calls:4d} acc={acc:4d} acc_rate={acc_rate:.2f} "
-        #               f"repair_fail={repf:4d} rep_rate={rep_rate:.2f} "
-        #               f"late_fail={latef:4d} late_rate={late_rate:.2f} avg_late_excess={avg_late_excess:.3f} "
-        #               f"sa_rej={sarej:4d} sa_rate={sa_rate:.2f} "
-        #               f"best_hits={besth:4d} best_rate={best_rate:.2f} "
-        #               f"avg_best_gain={avg_gain:.3f} total_best_gain={bestg:.3f}")
     # 打印偏爱算子
     dprint("[debug] best_route NODE_ID:", [data.nodes[i]['node_id'] for i in best_route])
 
@@ -1244,14 +1231,6 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
         ctx_in["__hit_stat"] = hit_stat
     except Exception:
         pass
-    # ===== [POST-DBG] 极简诊断：确认 ALNS 最终返回的是 best（而不是 cur）=====
-    if bool(ctx.get("dbg_postcheck", False)):
-        print(f"[ALNS-DBG] init(cost={init_cost:.3f},late={init_late:.3f}) | "
-              f"cur(cost={current_cost:.3f},late={current_total_late:.3f}) | "
-              f"best(cost={best_cost:.3f},late={best_total_late:.3f})")
-
-    # if bool(ctx.get("verbose_stat", True)):
-    #     _print_operator_stats(op_stat, top_k=int(ctx.get("verbose_stat_topk", 30)))
 
     # ===================== 收敛曲线写出（CSV） =====================
     # 中文注释：正常迭代结束/提前结束（非 n_inner<=0）也需要写出；否则用户看不到 converge_*.csv。
@@ -1436,26 +1415,10 @@ def run_decision_epoch(
             qf_deltas = {}
             qf_route_full, qf_b2d_full, qf_eval_preplan = None, None, None
         else:
-            # 中文注释：从 ab_cfg 读取 quick_filter / ALNS 关键参数；未配置则使用默认值。
+            # 中文注释：从 ab_cfg 读取 quick_filter 关键参数；未配置则使用默认值。
             qf_cost_max = float(ab_cfg.get("qf_cost_max", ab_cfg.get("delta_cost_max", 30.0)))
             qf_late_max = float(ab_cfg.get("qf_late_max", ab_cfg.get("delta_late_max", 0.10)))
 
-            remove_fraction_cfg = float(ab_cfg.get("remove_fraction", 0.10))
-            sa_T_start = float(ab_cfg.get("sa_T_start", 50.0))
-            sa_T_end = float(ab_cfg.get("sa_T_end", 1.0))
-            min_remove_cfg = int(ab_cfg.get("min_remove", 3))
-
-            # 中文注释：保底参数合法性（避免出现 0/负数温度导致 SA 退化）
-            if remove_fraction_cfg <= 0:
-                remove_fraction_cfg = 0.10
-            if sa_T_start <= 0:
-                sa_T_start = 50.0
-            if sa_T_end <= 0:
-                sa_T_end = 1.0
-            if sa_T_start < sa_T_end:
-                sa_T_start, sa_T_end = sa_T_end, sa_T_start
-            if min_remove_cfg < 1:
-                min_remove_cfg = 1
             data_next, decisions, qf_deltas, qf_route_full, qf_b2d_full, qf_eval_preplan = quick_filter_relocations(
                 data_cur=data_cur,
                 data_prelim=data_prelim,
@@ -1813,46 +1776,22 @@ def run_decision_epoch(
             drone_speed=sim.DRONE_SPEED_UNITS
         )
     planner = str(ab_cfg.get("planner", "ALNS")).upper()
-    # =======================
-    # 调试：打印 ALNS/GRB 子问题输入集合（可行域）用于对齐核对
-    # 开关：ab_cfg["dbg_planner_sets"]=True
-    # =======================
-    if bool(ab_cfg.get("dbg_planner_sets", False)):
-        def _fmt_set(name, s, k=12):
-            try:
-                arr = sorted(int(x) for x in set(s))
-            except Exception:
-                arr = sorted(list(s))
-            n = len(arr)
-            if n <= k:
-                show = arr
-            else:
-                h = k // 2
-                show = arr[:h] + ["..."] + arr[-h:]
-            return f"{name}: n={n}, sample={show}"
-
-        print(f"\n[PLANNER-SETS][BEFORE] scene={scene_idx} t={decision_time:.2f} planner={planner} start_idx={start_idx_for_alns}")
-        print(_fmt_set("served_all", served_all))
-        print(_fmt_set("unserved_all", unserved_all))
-        print(_fmt_set("visited_bases", visited_bases))
-        print(_fmt_set("bases_to_visit", bases_to_visit))
-        print(_fmt_set("feasible_bases_for_drone", feasible_bases_for_drone))
-        print(_fmt_set("allowed_customers", allowed_customers))
-        # 下面几类是你构造 allowed_customers 的来源，便于排查漏/多
-        try:
-            print(_fmt_set("req_set", req_set))
-        except Exception:
-            pass
-        try:
-            print(_fmt_set("unfinished_drone", unfinished_drone))
-        except Exception:
-            pass
-        try:
-            print(_fmt_set("forced_truck_eff", forced_truck_eff))
-        except Exception:
-            pass
 
     # 10. ALNS 求解 (Solve)
+
+    # [新增] 在这里统一获取 ALNS 的参数，保证任何情况下都能拿到值
+    remove_fraction_cfg = float(ab_cfg.get("remove_fraction", 0.10))
+    sa_T_start = float(ab_cfg.get("sa_T_start", 50.0))
+    sa_T_end = float(ab_cfg.get("sa_T_end", 1.0))
+    min_remove_cfg = int(ab_cfg.get("min_remove", 3))
+
+    # 保底参数合法性（避免出现 0/负数温度导致 SA 退化）
+    if remove_fraction_cfg <= 0: remove_fraction_cfg = 0.10
+    if sa_T_start <= 0: sa_T_start = 50.0
+    if sa_T_end <= 0: sa_T_end = 1.0
+    if sa_T_start < sa_T_end: sa_T_start, sa_T_end = sa_T_end, sa_T_start
+    if min_remove_cfg < 1: min_remove_cfg = 1
+
     ctx_for_alns = dict(ab_cfg)
     ctx_for_alns.update({
         "verbose": verbose,
@@ -1924,10 +1863,9 @@ def run_decision_epoch(
         # depot（central）
         _add_row(data_next.central_idx, "central", due_override=1e9)
 
-        # bases (关键修复：使用并集，确保 visited base 也在图里)
-        for b in bases_for_grb:
+        # bases (关键修复：使用并集并排序，确保跨平台遍历顺序一致)
+        for b in sorted(list(bases_for_grb)):
             _add_row(int(b), "base", due_override=1e9)
-
         # customers
         for c in allowed_customers:
             if str(data_next.nodes[c].get('node_type', '')).lower() != 'customer':
@@ -2015,6 +1953,20 @@ def run_decision_epoch(
             if int(ab_cfg.get("grb_verbose", 0)) >= 1:
                 print(
                     f"[GRB] milp_obj_km={grb_obj_km:.3f} | suffix_cost_units={alns_suffix_cost:.3f} | late_h={alns_suffix_late:.3f}")
+    elif planner == "GA":
+        # -----------------------
+        # [新增] 走 GA（遗传算法）分支
+        # -----------------------
+        (route_next, b2d_next, alns_suffix_cost, _, _, alns_suffix_late, _) = ga_solver.ga_truck_drone(
+            data_next, base_to_drone_next,
+            max_iter=int(ab_cfg.get('ga_max_iter', 100)),  # GA 收敛快，代数不用太多
+            pop_size=int(ab_cfg.get('ga_pop_size', 50)),
+            alpha_drone=0.3, lambda_late=50.0,
+            truck_customers=truck_next,
+            start_idx=start_idx_for_alns, start_time=decision_time, bases_to_visit=bases_to_visit,
+            ctx=ctx_for_alns
+        )
+        solver_val = time.time() - t_solve_start
     else:
         # -----------------------
         # 走 ALNS（你原代码不动）
@@ -2027,14 +1979,6 @@ def run_decision_epoch(
             ctx=ctx_for_alns
         )
         solver_val = time.time() - t_solve_start
-        if bool(ab_cfg.get("dbg_planner_sets", True)):
-            print(f"[PLANNER-SETS][AFTER-ALNS] suffix_cost={alns_suffix_cost:.3f} suffix_late={alns_suffix_late:.3f}")
-            print(f"[PLANNER-SETS][AFTER-ALNS] route_len={len(route_next)} route_head={route_next[:10]} route_tail={route_next[-10:] if len(route_next)>10 else route_next}")
-            try:
-                total_d = sum(len(v) for v in (b2d_next or {}).values())
-                print(f"[PLANNER-SETS][AFTER-ALNS] drone_assign_bases={sorted(list((b2d_next or {}).keys()))} total_drone_customers={total_d}")
-            except Exception as e:
-                print("[PLANNER-SETS][AFTER-ALNS] parse error:", e)
 
     # 11. 合并解 (Merge)
 
@@ -2209,21 +2153,6 @@ def run_decision_epoch(
             bad_full_late = bad_full_late or ((full_late - pre_late_full) > late_delta_full + eps)
 
         bad = bad or bad_full_late
-        # ===== [POST-DBG] 极简诊断：只打印一行，确认用的是 suffix 还是 full =====
-        if bool(ab_cfg.get("dbg_postcheck", False)):
-            def _f(x):
-                return "None" if x is None else f"{float(x):.3f}"
-            planner_tag = str(ab_cfg.get("planner", "ALNS")).upper()
-            if planner_tag in ("GRB", "GUROBI"):
-                planner_tag = "GRB"
-            elif planner_tag == "ALNS":
-                planner_tag = "ALNS"
-            mode = "SUFFIX" if use_suffix_check else "FULL"
-            print(f"[POST-DBG] mode={mode} | "
-                  f"suffix({planner_tag} cost={_f(alns_suffix_cost)}, late={_f(alns_suffix_late)} "
-                  f"vs PRE cost={_f(pre_suffix_cost)}, late={_f(pre_suffix_late)}) | "
-                  f"full({planner_tag} cost={_f(alns_cost)}, late={_f(alns_late)} "
-                  f"vs PRE cost={_f(pre_cost)}, late={_f(pre_late)})")
 
         if bad:
             if verbose or bool(ab_cfg.get("dbg_postcheck", False)):

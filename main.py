@@ -50,18 +50,39 @@ DEBUG_LATE_SCENES = None   # 只看 scene=0；想看全部就改成 None
 DEBUG_REINS_DIAG = False
 # 中文注释：指定某个客户 idx；None 表示自动选择“当前最迟到的卡车客户”
 DEBUG_REINS_CID = None
-# 四种算子（动作）
+
 CFG_A = {
     "NAME": "A_paired_baseline",
     "PAIRING_MODE": "paired",
-    "late_hard": 0.5,  # 建议显式写在 cfg 里（要更严就 0.10）
+"lambda_late": 200.0,
+    "late_hard": 0.8,  # 建议显式写在 cfg 里（要更严就 0.10）
+    "late_hard_delta": 1.0,
+# ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
+    "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
+    "qf_late_max": 0.5,   # 决策阶段：接受请求的Δlate上限（小时）
+
+    # ===== 新增：SA 温度尺度（从 cfg 读取）=====
+    "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
+    "sa_T_end": 1.0,       # SA 末温（后期更贪心）
+
+    # ===== 新增：destroy 强度（从 cfg 读取）=====
+    "remove_fraction": 0.18,
+    "min_remove": 5,
     # 固定两对：等价于你原来“捆绑”的两套组合
+    "DESTROYS": ["D_random_route", "D_worst_route", "D_reloc_focus_v2", "D_switch_coverage", "D_late_worst"],
+    "REPAIRS": ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone",
+                "R_late_repair_reinsert", "R_base_feasible_drone_first"],
     "ALLOWED_PAIRS": [
         ("D_random_route", "R_greedy_then_drone"),
         ("D_worst_route",  "R_regret_then_drone"),
+        ("D_reloc_focus_v2", "R_greedy_then_drone"),
+        # ↓↓↓ 核心王牌组合：迟到点直接转无人机 ↓↓↓
+        ("D_late_worst",   "R_late_repair_reinsert"),
     ],
-    "DESTROYS": ["D_random_route", "D_worst_route"],
-    "REPAIRS":  ["R_greedy_then_drone", "R_regret_then_drone"],
+"dbg_alns": False,
+    "dbg_postcheck": False,
+"disable_postcheck": 0,
+"lambda_prom": 0.0
 }
 
 CFG_D = {
@@ -71,17 +92,18 @@ CFG_D = {
     "late_hard_delta": 1.0,
     # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
     "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
-    "qf_late_max": 0.3,   # 决策阶段：接受请求的Δlate上限（小时）
+    "qf_late_max": 0.5,   # 决策阶段：接受请求的Δlate上限（小时）
 
     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
     "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
     "sa_T_end": 1.0,       # SA 末温（后期更贪心）
-
+"alns_max_iter": 1000,   # 最大跑 1000 代
+    "max_no_improve": 150,   # [新增] 连续 150 代不动就停
     # ===== 新增：destroy 强度（从 cfg 读取）=====
     "remove_fraction": 0.18,
     "min_remove": 5,
-    "DESTROYS": ["D_random_route", "D_worst_route", "D_reloc_focus_v2", "D_switch_coverage"],
-    "REPAIRS":  ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone", "R_late_repair_reinsert", "R_base_feasible_drone_first"],
+    "DESTROYS": ["D_reloc_focus_v2","D_switch_coverage","D_worst_route","D_random_route","D_late_worst"],
+    "REPAIRS":  ["R_regret_then_drone","R_base_feasible_drone_first","R_late_repair_reinsert"],
     "dbg_alns": False,
     "dbg_postcheck": False,
 "disable_postcheck": 0,
@@ -121,6 +143,20 @@ CFG_TRUCK = {
     "sa_T_start": 50.0,
     "sa_T_end": 1.0,
     "remove_fraction": 0.15,
+}
+
+CFG_GA = {
+    "NAME": "Baseline_GA",
+    "name": "Baseline_GA",     # <--- [补齐] 适配 CSV 输出的 name 字段
+    "method": "GA",
+    "planner": "GA",
+    "ga_max_iter": 150,
+    "ga_pop_size": 50,
+    "crossover_rate": 0.8,     # <--- [补齐] 显式记录默认值
+    "mutation_rate": 0.2,      # <--- [补齐] 显式记录默认值
+    "late_hard": 0.5,
+    "qf_cost_max": 30.0,
+    "qf_late_max": 0.5,
 }
 def dprint(*args, **kwargs):
     """统一的调试打印开关，避免到处散落 print"""
@@ -578,6 +614,7 @@ def run_compare_suite(
     groups = [
         ("Greedy", cfg_greedy),  # 对应原来的 G1
         ("TruckOnly", cfg_truck),  # 新增
+        ("GA", CFG_GA),
         ("Proposed", cfg_proposed)  # 对应原来的 G3
     ]
     all_rows = []
@@ -597,13 +634,43 @@ def run_compare_suite(
         )
         ut.print_summary_table(res)
 
-        # 打平写入 compare CSV
-        for rec in res:
-            row = dict(rec)
+        # [修改 1] 将 run_one 返回的列表重命名为 history，避免与下面的单步结果混淆
+        history = run_one(file_path, cfg=cfg, seed=seed, verbose=False)
+
+        # [修改 2] 循环变量命名为 step_res (单步结果)
+        for t, step_res in enumerate(history):
+            if step_res is None: continue
+
+            # [Risk 1 修复] 强制统一 Cost 口径 (Base Cost + Penalty)
+            # 这里的 step_res 是字典，不会再报 'list' object has no attribute 'get'
+            truck_d = float(step_res.get('truck_dist', 0.0))
+            drone_d = float(step_res.get('drone_dist', 0.0))
+            total_l = float(step_res.get('total_late', 0.0))
+
+            # 读取参数 (优先从 cfg 读取，保证和决策时一致)
+            # 假设 alpha 固定为 0.3
+            alpha_val = 0.3
+            lam_val = float(cfg.get('lambda_late', 50.0))
+
+            # 重算标准指标
+            base_cost_calc = truck_d + alpha_val * drone_d
+            penalty_calc = lam_val * total_l
+            obj_cost_calc = base_cost_calc + penalty_calc
+
+            # 构建写入行
+            row = dict(step_res)  # 复制原始数据
             row.update({
                 "method": gname,
                 "seed": int(seed),
-                "cfg_name": str(cfg.get("name", "")),
+                # 增强名字提取鲁棒性 (优先取 name, 其次 NAME)
+                "cfg_name": str(cfg.get("name", cfg.get("NAME", ""))),
+
+                # [Risk 1] 核心修正：覆盖为统一口径
+                "base_cost": base_cost_calc,
+                "penalty": penalty_calc,
+                "cost": obj_cost_calc,  # <--- 修正后的总目标函数值
+
+                # 补充配置参数列 (ALNS/GA 通用)
                 "g0_policy": str(cfg.get("g0_policy", "")) if gname == "G0" else "",
                 "qf_cost_max": cfg.get("qf_cost_max", cfg.get("delta_cost_max", "")),
                 "qf_late_max": cfg.get("qf_late_max", cfg.get("delta_late_max", "")),
@@ -611,9 +678,14 @@ def run_compare_suite(
                 "min_remove": cfg.get("min_remove", ""),
                 "sa_T_start": cfg.get("sa_T_start", ""),
                 "sa_T_end": cfg.get("sa_T_end", ""),
-                "late_hard": cfg.get("late_hard", ""),
-                "late_hard_delta": cfg.get("late_hard_delta", ""),
+                "late_hard": cfg.get("late_hard", ""),  # [Risk 3] 记录硬约束阈值
                 "alns_max_iter": cfg.get("alns_max_iter", ""),
+
+                # GA 专属参数
+                "ga_pop_size": cfg.get("ga_pop_size", ""),
+                "ga_max_iter": cfg.get("ga_max_iter", ""),
+                "ga_cx_rate": cfg.get("crossover_rate", ""),
+                "ga_mut_rate": cfg.get("mutation_rate", ""),
             })
             all_rows.append(row)
 
@@ -753,10 +825,17 @@ def main():
     # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
     # file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
-    file_path = r"D:\代码\ALNS+DL\nodes_100_seed2023_20260124_144032.csv"
-    events_path = r"D:\代码\ALNS+DL\events_100_seed2023_20260124_144032.csv"
+    file_path = r"D:\代码\ALNS+DL\OR-Tool\100\r_150\nodes_100_seed2023_20260124_144032_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\OR-Tool\100\r_150\events_100_seed2023_20260124_144032.csv"
+    # file_path = r"D:\代码\ALNS+DL\nodes_200_seed2023_20260124_151512.csv"
+    # events_path = r"D:\代码\ALNS+DL\events_200_seed2023_20260124_151512.csv"
     seed = 2025
     cfg = dict(CFG_D)
+    cfg.update({
+        "reloc_focus_mode": "rej_first",
+        "drone_first_pick": "min_obj",
+    })
+
     # cfg["planner"] = "GRB"  # 让 dynamic_logic 走 gurobi 分支
     cfg["planner"] = "ALNS"
     cfg["grb_time_limit"] = 1800  # 每个决策点的 MILP 限时（秒）
@@ -792,7 +871,7 @@ def main():
     RUN_ROAD_SANITY = False
 
     # 3.4 对照组套件：G0–G3（动态对比）
-    RUN_COMPARE_SUITE = False
+    RUN_COMPARE_SUITE = True
 
     # ===== 4) road sanity =====
     if RUN_ROAD_SANITY:
