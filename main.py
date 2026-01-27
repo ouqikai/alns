@@ -136,10 +136,10 @@ CFG_TRUCK = {
     "DESTROYS": ["D_random_route", "D_worst_route"],
     "REPAIRS": ["R_greedy_only", "R_regret_only"],  # 只用纯卡车 Repair
 
-    "late_hard": 0.5,  # 保持一致
+    "late_hard": 0.1,  # 保持一致
     "late_hard_delta": 1.0,
     "qf_cost_max": 30.0,
-    "qf_late_max": 0.3,
+    "qf_late_max": 0.5,
     "sa_T_start": 50.0,
     "sa_T_end": 1.0,
     "remove_fraction": 0.15,
@@ -151,10 +151,11 @@ CFG_GA = {
     "method": "GA",
     "planner": "GA",
     "ga_max_iter": 150,
+    "max_no_improve": 30,
     "ga_pop_size": 50,
     "crossover_rate": 0.8,     # <--- [补齐] 显式记录默认值
     "mutation_rate": 0.2,      # <--- [补齐] 显式记录默认值
-    "late_hard": 0.5,
+    "late_hard": 0.1,
     "qf_cost_max": 30.0,
     "qf_late_max": 0.5,
 }
@@ -320,6 +321,50 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
     scene0_runtime = t0_end - t0_start
     if verbose:
         print(f"    [SCENE 0] Runtime={scene0_runtime:.3f} s")
+    # ================= [新增补丁：纯卡车路线方向校正] =================
+    # 目的：强制翻转“逆序”路线，防止卡车过早服务大ID客户，导致动态请求失效。
+    is_truck_only_mode = bool(ab_cfg.get("force_truck_mode", False))
+
+    # 仅对 TruckOnly 且路线包含至少2个客户时生效
+    if is_truck_only_mode and len(best_route) > 3:
+        # 1. 提取中间客户序列（去除首尾 Depot）
+        # best_route 结构通常是 [Depot, C1, C2, ..., Cn, Depot]
+        inner_indices = best_route[1:-1]
+
+        # 2. 获取首尾客户的 NODE_ID (通常 ID 越大数据集中时间越晚)
+        first_node_id = data.nodes[inner_indices[0]]['node_id']
+        last_node_id = data.nodes[inner_indices[-1]]['node_id']
+
+        # 3. 判定：如果是降序 (例如 100 -> ... -> 1)，说明跑反了
+        if first_node_id > last_node_id:
+            if verbose:
+                print(f"[TRUCK-TUNE] 🚨 检测到路线逆序 (ID {first_node_id} -> ... -> {last_node_id})。")
+                print(f"[TRUCK-TUNE] 正在翻转路线以匹配事件流，改善请求有效性...")
+
+            # 4. 执行翻转
+            # 保持首尾 Depot 不动，中间倒序
+            best_route = [best_route[0]] + inner_indices[::-1] + [best_route[-1]]
+
+            # 5. !!! 极其重要：翻转后必须强制重算所有状态 !!!
+            # 否则后续动态逻辑会沿用旧的到达时间表，导致逻辑错乱
+
+            # 重新跑一遍系统评估，获取最新状态
+            # 注意：这里的 lambda_late 建议用 50.0 以便看清翻转后的真实代价
+            _eval_fixed = sim.evaluate_full_system(
+                data, best_route, best_b2d,
+                alpha_drone=0.3, lambda_late=50.0,
+                truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
+            )
+
+            # 更新关键变量，供后续动态循环使用
+            best_cost = _eval_fixed['cost']
+            best_truck_dist = _eval_fixed['truck_dist']
+            best_total_late = _eval_fixed['total_late']
+
+            # 这里的 arrival_times 会在下面几行代码被再次计算，
+            # 但为了保险起见，这里先更新 best_route 对应的状态。
+            if verbose:
+                print(f"[TRUCK-TUNE] ✅ 翻转完成。新状态: Cost={best_cost:.3f}, Late={best_total_late:.3f}")
     arrival_times, total_time, total_late = sim.compute_truck_schedule(
         data, best_route, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
     )
@@ -375,9 +420,10 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
 
     # ===================== 4) 结果表：先记场景0（FULL口径）=====================
     scenario_results = []
+    report_lambda = float(ab_cfg.get("lambda_late", 50.0))
     full_eval0 = sim.evaluate_full_system(
         data, best_route, best_b2d,
-        alpha_drone=0.3, lambda_late=0.0,
+        alpha_drone=0.3, lambda_late=report_lambda,
         truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
     )
     # ===================== 【新增：专门为 Greedy 补齐 Scene 0 记录】 =====================
@@ -407,7 +453,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         # 如需查看 TopK 迟到客户，请查 late_logs/*.csv（emit_scene_late_logs 会写出）。
         pass
 
-    scenario_results.append(ut._pack_scene_record(0, 0.0, full_eval0, num_req=0, num_acc=0, num_rej=0, alpha_drone=0.3, lambda_late=50.0, solver_time=scene0_runtime))
+    scenario_results.append(ut._pack_scene_record(0, 0.0, full_eval0, num_req=0, num_acc=0, num_rej=0, alpha_drone=0.3, lambda_late=report_lambda, solver_time=scene0_runtime))
     global_xlim, global_ylim = compute_global_xlim_ylim(
         data=data,
         reloc_radius=ab_cfg.get("reloc_radius", 0.8),
@@ -554,7 +600,7 @@ def run_compare_suite(
         events_path: str = None,
         out_dir: str = "outputs",
         enable_plot: bool = False,
-        verbose: bool = False,
+        verbose: bool = False, target_methods: list = None,
 ):
     """在同一 nodes/events/seed 下，跑 G0–G3 四组对照，并输出 compare_*.csv。
 
@@ -611,12 +657,18 @@ def run_compare_suite(
     })
 
     # 2. 构造对比列表 (删除 G0, G2)
-    groups = [
+    all_groups = [
         ("Greedy", cfg_greedy),  # 对应原来的 G1
         ("TruckOnly", cfg_truck),  # 新增
         ("GA", CFG_GA),
         ("Proposed", cfg_proposed)  # 对应原来的 G3
     ]
+    if target_methods:
+        groups = [g for g in all_groups if g[0] in target_methods]
+        print(f"[SUITE] 🎯 仅运行指定算法: {target_methods}")
+    else:
+        groups = all_groups
+        print(f"[SUITE] 🚀 运行完整对比套件 (全量)")
     all_rows = []
 
     for gname, cfg in groups:
@@ -635,8 +687,7 @@ def run_compare_suite(
         ut.print_summary_table(res)
 
         # [修改 1] 将 run_one 返回的列表重命名为 history，避免与下面的单步结果混淆
-        history = run_one(file_path, cfg=cfg, seed=seed, verbose=False)
-
+        history = res
         # [修改 2] 循环变量命名为 step_res (单步结果)
         for t, step_res in enumerate(history):
             if step_res is None: continue
@@ -936,13 +987,16 @@ def main():
         return
     # ===== 6.5) 对照组套件：G0–G3 =====
     if RUN_COMPARE_SUITE:
+        # 可选值: "Greedy", "TruckOnly", "GA", "Proposed"
+        # 留空 [] 或 None 表示跑所有
+        METHODS_TO_RUN = ["TruckOnly"]
         run_compare_suite(
             file_path=file_path, seed=seed, base_cfg=cfg,
             perturbation_times=perturbation_times,
             events_path=events_path,
             out_dir='outputs',
             enable_plot=False,
-            verbose=True
+            verbose=True, target_methods=METHODS_TO_RUN
         )
         return
     # ===== 7) 正常动态运行（你平时跑的模式）=====

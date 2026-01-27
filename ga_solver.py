@@ -151,7 +151,7 @@ def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,
     # [Fix Risk 3] 读取硬迟到阈值 (必须与 ALNS 对齐)
     # 默认值 0.5 小时，必须与 main.py 配置一致
     late_hard = float(ctx.get("late_hard", 0.5))
-
+    max_no_improve = int(ctx.get("max_no_improve", 50))
     # [Fix Risk 1] 获取 visited 和 onhand 信息
     visited_bases = ctx.get("visited_bases", [])
     visited_bases_set = set(visited_bases)
@@ -161,22 +161,44 @@ def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,
         start_idx = data.central_idx
     end_idx = data.central_idx
 
-    # [Fix Risk 2] 禁止 bases_to_visit 默认全开，严格尊重传入值
+    # 1) bases_to_visit 强校验与 fallback (Fix User Request #1)
+    if bases_to_visit is None and ctx is not None:
+        bases_to_visit = ctx.get("bases_to_visit")
+
     if bases_to_visit is None:
-        # 如果未传，回退到 safe default: 仅 central + 所有在当前解里的基站 (偏保守，防止非法)
-        # 但在 ALNS 框架下，caller 应该负责传入正确的 bases_to_visit
-        bases_to_visit = [data.central_idx]
+        # 方案 A: 强制报错，防止默默退化为仅 central
+        raise ValueError(
+            "[GA-FATAL] bases_to_visit is None! GA will degrade to TruckOnly. Please pass correct bases list.")
+
+    # Debug 打印
+    if ctx.get("verbose", False):
+        print(f"[GA-DBG] bases_to_visit count={len(bases_to_visit)}, first5={bases_to_visit[:5]}")
 
     if truck_customers is None: truck_customers = []
 
-    # 1. 汇总所有需要参与调度的客户 (Allowed Customers)
-    # [Fix Risk 5] 集合转列表后必须 sorted
+    # 2) allowed_customers 严格过滤 (Fix User Request #2)
+    # 必须排除 base/central 节点，否则 GA 会将其视为客户进行排列，导致解码异常
     _drone_custs = {c for cs in base_to_drone_customers.values() for c in cs}
-    allowed_customers = sorted(list(set(truck_customers) | _drone_custs))
+    raw_allowed = set(truck_customers) | _drone_custs
+    allowed_customers = []
+    _ignored_nodes = []
+
+    for c in raw_allowed:
+        # 严格检查 node_type
+        ntype = str(data.nodes[c].get("node_type", "")).lower()
+        if ntype == "customer":
+            allowed_customers.append(c)
+        else:
+            _ignored_nodes.append(c)
+
+    allowed_customers.sort()
+
+    if _ignored_nodes:
+        print(
+            f"[WARN-GA] Filtered out non-customer nodes from allowed set: {_ignored_nodes} (Types: {[data.nodes[i].get('node_type') for i in _ignored_nodes]})")
 
     if not allowed_customers:
         return [start_idx, end_idx], {}, 0.0, 0.0, 0.0, 0.0, 0.0
-
     # 预处理：识别 force_truck 和 可行基站
     cust_info = {}
     for cid in allowed_customers:
@@ -198,7 +220,25 @@ def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,
             'force_truck': node.get("force_truck", 0) == 1,
             'feas_bases': feas_bases
         }
+    # 3) 补齐 arrival_prefix (Fix User Request #3)
+    # 确保 visited_bases 的发飞时间不缺失，否则评估函数会由默认值导致异常
+    if arrival_prefix is None:
+        arrival_prefix = {}
+    else:
+        arrival_prefix = dict(arrival_prefix)  # 浅拷贝避免副作用
 
+    _patched_bases = []
+    for b in visited_bases_set:
+        if b not in arrival_prefix:
+            arrival_prefix[b] = float(start_time)
+            _patched_bases.append(b)
+
+    if _patched_bases and ctx.get("verbose", False):
+        print(f"[GA-DBG] Patched arrival_prefix for visited bases (set to t={start_time:.2f}): {_patched_bases}")
+
+    # 4) late_hard 检查 (Fix User Request #4)
+    if late_hard > 240.0:  # 经验值：如果大于 240h 可能配置有误
+        print(f"[WARN-GA] late_hard={late_hard} seems very large. Check config.")
     # [核心修改] 评估函数：加入硬约束惩罚
     def evaluate(ind):
         # 1. 解码 (含修复逻辑)
@@ -229,9 +269,60 @@ def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,
 
         return res
 
+    # =================================================
+    # [Fix Risk 6] 热启动：注入 Greedy/Preplan 解 (防止 GA 跑输基线)
+    # =================================================
+    warm_start_ind = None
+    init_route = ctx.get("init_route", None)
+
+    if init_route:
+        # 1. 提取 Greedy 解中的卡车客户顺序 (基因 Perm 的一部分)
+        # 注意：init_route 包含 base/central，需提取 allowed_customers 里的 subset
+        greedy_truck_seq = []
+        _seen = set()
+        for nid in init_route:
+            if (nid in cust_info) and (nid not in _seen):
+                greedy_truck_seq.append(nid)
+                _seen.add(nid)
+
+        # 2. 提取无人机客户 (拼接到 Perm 尾部)
+        # (在 GA 编码中，无人机客户在 perm 中的位置不影响分配，只要在 perm 里就行)
+        greedy_drone_seq = [c for c in allowed_customers if c not in _seen]
+
+        # 3. 构造精英染色体 Perm
+        elite_perm = greedy_truck_seq + greedy_drone_seq
+
+        # 4. 构造精英分配 Assign
+        # 默认全部 Truck，然后根据 base_to_drone_customers 修正为 Drone
+        elite_assign = {c: 'truck' for c in allowed_customers}
+
+        # 反查表：client -> base
+        _c_to_b = {}
+        for b, cs in base_to_drone_customers.items():
+            for c in cs:
+                _c_to_b[c] = b
+
+        for c in allowed_customers:
+            # 如果原解是无人机，且该基站当前仍可行，则保持无人机
+            if c in _c_to_b:
+                target_b = _c_to_b[c]
+                if target_b in cust_info[c]['feas_bases']:
+                    elite_assign[c] = target_b
+            # 否则保持默认 'truck' (elite_assign初始化值)
+
+        # 校验长度防崩
+        if len(elite_perm) == len(allowed_customers):
+            warm_start_ind = (elite_perm, elite_assign)
+            if ctx.get("verbose", False):
+                print(f"[GA-DBG] Injected Warm-Start solution (truck_len={len(greedy_truck_seq)})")
     # 3. 初始化种群
     population = []
-    for _ in range(pop_size):
+    # 如果有热启动解，先加进去
+    if warm_start_ind:
+        population.append(copy.deepcopy(warm_start_ind))
+
+    # 补齐剩余个体 (随机)
+    while len(population) < pop_size:
         # 3.1 随机排列
         perm = allowed_customers[:]
         random.shuffle(perm)
@@ -250,7 +341,7 @@ def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,
 
     best_ind = population[0]
     best_eval = evaluate(best_ind)
-
+    no_improve_cnt = 0
     # 遗传算子
     def crossover_ox(p1_perm, p2_perm):
         size = len(p1_perm)
@@ -292,9 +383,20 @@ def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,
         # 按 cost 排序 (res[0])
         pop_evals.sort(key=lambda x: x[1][0])
 
-        if pop_evals[0][1][0] < best_eval[0]:
+        # [修改] 检查是否有改进 (使用 epsilon 避免浮点误差)
+        # 如果当前代的最优解比历史最优解更好
+        if pop_evals[0][1][0] < best_eval[0] - 1e-6:
             best_ind = pop_evals[0][0]
             best_eval = pop_evals[0][1]
+            no_improve_cnt = 0  # 重置计数器
+        else:
+            no_improve_cnt += 1  # 计数器累加
+
+        # [新增] 早停检查
+        if no_improve_cnt >= max_no_improve:
+            if ctx.get("verbose", False):
+                print(f"[GA-STOP] Early stopping at gen {gen} (no improve for {max_no_improve} gens)")
+            break
 
         next_gen = [pop_evals[0][0]]  # 精英保留
 

@@ -2081,17 +2081,21 @@ def run_decision_epoch(
     )
     # ================= [新增诊断打印] =================
     if verbose and (qf_eval_preplan is not None):
-        # 获取 ALNS 跑完后的成本
-        cost_alns = float(full_eval.get("cost", 0.0))
+        # 获取 ALNS/GA 跑完后的成本
+        cost_solver = float(full_eval.get("cost", 0.0))
         # 获取 Greedy (Preplan) 的原始成本
         cost_greedy = float(qf_eval_preplan.get("cost", qf_eval_preplan.get("cost(obj)", 0.0)))
 
-        diff = cost_alns - cost_greedy
+        diff = cost_solver - cost_greedy
 
-        print(f"    [COMPARE-INTERNAL] ALNS={cost_alns:.4f} vs Greedy={cost_greedy:.4f} | Diff={diff:.4f}")
+        # (Fix User Request #5) 动态显示 Planner 名称
+        planner_name = str(ab_cfg.get("planner", "ALNS")).upper()
+        if method == "GA": planner_name = "GA"  # 优先用 method 字段区分
+
+        print(f"    [COMPARE-INTERNAL] {planner_name}={cost_solver:.4f} vs Greedy={cost_greedy:.4f} | Diff={diff:.4f}")
 
         if abs(diff) < 1e-6:
-            print("    [ANALYSIS] ALNS 完全没有改动初始解（可能是迭代次数太少，或初始解已是局部最优）")
+            print(f"    [ANALYSIS] {planner_name} 完全没有改动初始解")
         elif diff > 0:
             print("    [ANALYSIS] ALNS 跑输了！结果比贪婪还差（稍后可能会触发回滚）")
         else:
