@@ -1,7 +1,3 @@
-# simulation.py
-import math
-import copy
-from utils import compute_eta_map  # 如果 alns 依赖它，也可从这导
 import utils as ut
 
 # =========================

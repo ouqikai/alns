@@ -1,6 +1,5 @@
 # operators.py
 import random
-import math
 import simulation as sim
 
 # =========================================================

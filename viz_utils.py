@@ -1,6 +1,5 @@
 import math
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 from matplotlib.lines import Line2D

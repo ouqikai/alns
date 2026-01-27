@@ -6,8 +6,6 @@
 # - 你最终确定的数据集列：
 #   NODE_ID,NODE_TYPE,ORIG_X,ORIG_Y,PERTURBED_X,PERTURBED_Y,DEMAND,READY_TIME,DUE_TIME,REQUEST_TIME
 
-from __future__ import annotations
-
 import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence

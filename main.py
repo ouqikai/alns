@@ -989,7 +989,7 @@ def main():
     if RUN_COMPARE_SUITE:
         # 可选值: "Greedy", "TruckOnly", "GA", "Proposed"
         # 留空 [] 或 None 表示跑所有
-        METHODS_TO_RUN = ["TruckOnly"]
+        METHODS_TO_RUN = ["Proposed"]
         run_compare_suite(
             file_path=file_path, seed=seed, base_cfg=cfg,
             perturbation_times=perturbation_times,
