@@ -17,9 +17,7 @@
 
 说明：本文件仍保持可直接运行（main()/main_cli()），便于你现有实验脚本与复现流程不改。
 """
-import os
-import time
-import csv
+import os, time, json, csv, copy
 import operators as ops  # 引入算子模块
 import simulation as sim  # 引入仿真模块
 import utils as ut # 工具模块
@@ -54,7 +52,7 @@ DEBUG_REINS_CID = None
 CFG_A = {
     "NAME": "A_paired_baseline",
     "PAIRING_MODE": "paired",
-"lambda_late": 200.0,
+"lambda_late": 50.0,
     "late_hard": 0.8,  # 建议显式写在 cfg 里（要更严就 0.10）
     "late_hard_delta": 1.0,
 # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
@@ -97,52 +95,18 @@ CFG_D = {
     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
     "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
     "sa_T_end": 1.0,       # SA 末温（后期更贪心）
-"alns_max_iter": 1000,   # 最大跑 1000 代
-    "max_no_improve": 150,   # [新增] 连续 150 代不动就停
+    "alns_max_iter": 1000,   # 最大跑 1000 代
+    "max_no_improve": 1000,   # [新增] 连续 150 代不动就停
     # ===== 新增：destroy 强度（从 cfg 读取）=====
     "remove_fraction": 0.18,
     "min_remove": 5,
-    "DESTROYS": ["D_reloc_focus_v2","D_switch_coverage","D_worst_route","D_random_route","D_late_worst"],
-    "REPAIRS":  ["R_regret_then_drone","R_base_feasible_drone_first","R_late_repair_reinsert"],
+    "DESTROYS": ["D_random_route", "D_worst_route", "D_reloc_focus_v2", "D_switch_coverage", "D_late_worst"],
+    "REPAIRS": ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone",
+                "R_late_repair_reinsert", "R_base_feasible_drone_first"],
     "dbg_alns": False,
     "dbg_postcheck": False,
 "disable_postcheck": 0,
 "lambda_prom": 0.0
-}
-
-CFG_GREEDY = {
-    "NAME": "Baseline_Greedy",
-    "method": "Greedy",  # 标识符，用于输出 CSV
-    "planner": "ALNS",  # 强制使用 ALNS (哪怕 max_iter=0)
-    "alns_max_iter": 0,  # 关键：0迭代，只做构造/插入
-    "remove_fraction": 0.0,  # 不重要
-    "min_remove": 0,  # 不重要
-    "late_hard": 1e18,  # 贪婪通常不做硬约束，或者你可以设为和 G3 一样
-    "late_hard_delta": 1e18,
-
-    # 算子列表其实不运行，但为了防报错保留默认
-    "DESTROYS": ["D_random_route"],
-    "REPAIRS": ["R_greedy_only"],
-}
-
-CFG_TRUCK = {
-    "NAME": "Baseline_TruckOnly",
-    "method": "TruckOnly",
-    "planner": "ALNS",  # 使用 ALNS 优化纯卡车路径
-    "alns_max_iter": 1000,  # 允许充分优化
-    "force_truck_mode": True,  # <--- 自定义开关：强制纯卡车
-
-    # 纯卡车不需要复杂的 Destroy，基本的 Random/Worst 即可
-    "DESTROYS": ["D_random_route", "D_worst_route"],
-    "REPAIRS": ["R_greedy_only", "R_regret_only"],  # 只用纯卡车 Repair
-
-    "late_hard": 0.1,  # 保持一致
-    "late_hard_delta": 1.0,
-    "qf_cost_max": 30.0,
-    "qf_late_max": 0.5,
-    "sa_T_start": 50.0,
-    "sa_T_end": 1.0,
-    "remove_fraction": 0.15,
 }
 
 CFG_GA = {
@@ -159,6 +123,18 @@ CFG_GA = {
     "qf_cost_max": 30.0,
     "qf_late_max": 0.5,
 }
+CFG_GUROBI = {
+    "name": "GUROBI",
+    "planner": "GUROBI",
+    "force_truck_mode": False,
+    "grb_time_limit": 60,     # 你自己定
+    "grb_mip_gap": 0.0,       # 小规模可 0；大规模建议 >0
+    "grb_verbose": 0,
+    "late_hard": 0.1,
+    "qf_cost_max": 30.0,
+    "qf_late_max": 0.5,
+}
+
 def dprint(*args, **kwargs):
     """统一的调试打印开关，避免到处散落 print"""
     if DEBUG:
@@ -179,9 +155,14 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         perturbation_times = []
     # 统一过滤/去重/排序，避免传入 0 导致重复场景、以及不同运行方式输出不一致
     perturbation_times = ut._normalize_perturbation_times(perturbation_times)
-
+    seed_py_rng, seed_np_rng = "", ""
     if seed is not None:
         ut.set_seed(int(seed))
+        try:
+            import random, pickle, hashlib
+            import numpy as np
+        except Exception:
+            seed_py_rng, seed_np_rng = "", ""
 
     ab_cfg = ops.build_ab_cfg(ab_cfg)
 
@@ -452,8 +433,15 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         # 中文注释：debug_print_lateness_topk 已在 slim 版本中移除（避免控制台大输出拖慢实验）。
         # 如需查看 TopK 迟到客户，请查 late_logs/*.csv（emit_scene_late_logs 会写出）。
         pass
+    rec0 = ut._pack_scene_recordrec0 = ut._pack_scene_record(
+    0, 0.0, full_eval0,
+    num_req=0, num_acc=0, num_rej=0,
+    alpha_drone=0.3, lambda_late=report_lambda,
+    solver_time=scene0_runtime
+)
+    rec0.update({"seed_py_rng": seed_py_rng, "seed_np_rng": seed_np_rng})
+    scenario_results.append(rec0)
 
-    scenario_results.append(ut._pack_scene_record(0, 0.0, full_eval0, num_req=0, num_acc=0, num_rej=0, alpha_drone=0.3, lambda_late=report_lambda, solver_time=scene0_runtime))
     global_xlim, global_ylim = compute_global_xlim_ylim(
         data=data,
         reloc_radius=ab_cfg.get("reloc_radius", 0.8),
@@ -521,7 +509,9 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
                 break
 
             # 3. 收集结果与日志
+            step_res['stat_record'].update({"seed_py_rng": seed_py_rng, "seed_np_rng": seed_np_rng})
             scenario_results.append(step_res['stat_record'])
+
             if 'decision_log_rows' in step_res:
                 decision_log_rows.extend(step_res['decision_log_rows'])
 
@@ -576,7 +566,7 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
 
     # ---------- 保存 decision_log（离线 events.csv 模式） ----------
     try:
-        if offline_groups is not None:
+        if offline_groups is not None and bool(ab_cfg.get("save_decision_log", True)):
             _out = decision_log_path
             if (not _out) or (str(_out).strip() == ""):
                 base = os.path.splitext(os.path.basename(file_path))[0]
@@ -602,45 +592,51 @@ def run_compare_suite(
         enable_plot: bool = False,
         verbose: bool = False, target_methods: list = None,
 ):
-    """在同一 nodes/events/seed 下，跑 G0–G3 四组对照，并输出 compare_*.csv。
+    """在同一 nodes/events/seed 下，跑多算法对照，并输出 metrics_timeseries.csv。
 
-    G0: No-Replan（默认策略：全部拒绝请求，且不更新路线/坐标）
-    G1: Preplan-Only（只快筛+局部修补，不跑 ALNS）
-    G2: ALNS-Weak（弱探索：低温度 + 低破坏强度）
-    G3: Full（主方法：快筛阈值统一 + SA 温度可配 + destroy 强度可配 + late 护栏 + post-check 口径一致）
+    可用方法标签（gname）：
+    - TruckOnly：纯卡车模型（force_truck_mode=True，仍用 ALNS 优化）
+    - Proposed：你的主方法（混合模型 + ALNS）
+    - Greedy：贪心/预规划基线（对应 dynamic_logic 的 G1 分支）
+    - GA：遗传算法
+    - Gurobi：MILP（planner=GRB）
+    通过 target_methods 传入 gname 列表可筛选子集。
     """
     if perturbation_times is None:
         perturbation_times = []
 
     os.makedirs(out_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(file_path))[0]
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    compare_csv_path = os.path.join(out_dir, f"compare_{base_name}_seed{seed}_{ts}.csv")
+
+    # 固定短文件名：每个 run_dir 里永远叫这个
+    compare_csv_path = os.path.join(out_dir, "metrics_timeseries.csv")
 
     # 统一基础配置（默认关掉大量 DBG 打印）
     cfg_base = dict(base_cfg)
     cfg_base.setdefault("dbg_alns", False)
     cfg_base.setdefault("dbg_postcheck", False)
     cfg_base.setdefault("alns_max_iter", 1000)
+    cfg_base.setdefault("save_iter_trace", False)  # 默认不保存单场景迭代轨迹
+    cfg_base.setdefault("save_decision_log", False)  # 批量套件默认不保存 decision_log，避免文件爆炸
 
     # 1. 定义配置
     # -----------------------------------------------
     # G1: Greedy / Preplan (基线：无重排)
     # -----------------------------------------------
-    cfg_greedy = dict(base_cfg)
+    cfg_greedy = dict(cfg_base)
     cfg_greedy.update({
         "name": "Baseline_Greedy",
-        "method": "G1"  # 对应 dynamic_logic 里 G1 的逻辑
+        "method": "G1", "planner": "GREEDY"
     })
 
     # -----------------------------------------------
     # TruckOnly: 纯卡车 (消融：无无人机) -> 需要在上一步 dynamic_logic 里加拦截
     # -----------------------------------------------
-    cfg_truck = dict(base_cfg)
+    cfg_truck = dict(cfg_base)
     cfg_truck.update({
-        "name": "Baseline_TruckOnly",
-        "method": "TruckOnly",
-        "force_truck_mode": True,  # 开启纯卡车模式开关
+        "name": "ALNS_TruckOnly",
+        "planner": "ALNS",          # 明确
+        "force_truck_mode": True,
         # 纯卡车可以用较强的算子，保证公平对比
         "alns_max_iter": 1000,
         "DESTROYS": ["D_random_route", "D_worst_route"],
@@ -650,25 +646,42 @@ def run_compare_suite(
     # -----------------------------------------------
     # G3: Proposed (你的主方法)
     # -----------------------------------------------
-    cfg_proposed = dict(base_cfg)
-    cfg_proposed.update({
-        "name": "Proposed_Method",
-        "method": "G3"
+    cfg_alns_hybrid = dict(cfg_base)
+    cfg_alns_hybrid.update({
+        "name": "ALNS_Hybrid",
+        "planner": "ALNS",
+        "force_truck_mode": False,
+    })
+    # -----------------------------------------------
+    # Gurobi: MILP 基线
+    # -----------------------------------------------
+    cfg_grb = dict(cfg_base)
+    cfg_grb.update({
+        "name": "Baseline_Gurobi",
+        "method": "GRB",
+        "planner": "GRB",
     })
 
-    # 2. 构造对比列表 (删除 G0, G2)
+    # -----------------------------------------------
+    # GA: 遗传算法（继承 base_cfg，避免 lambda_late/qf 阈值等不一致）
+    # -----------------------------------------------
+    cfg_ga = dict(cfg_base)
+    cfg_ga.update(dict(CFG_GA))  # CFG_GA 里有 planner="GA"
+    # 2. 构造对比列表（用“对外标签”，与 TARGET_METHODS 保持一致）
     all_groups = [
-        ("Greedy", cfg_greedy),  # 对应原来的 G1
-        ("TruckOnly", cfg_truck),  # 新增
-        ("GA", CFG_GA),
-        ("Proposed", cfg_proposed)  # 对应原来的 G3
+        ("Proposed", cfg_alns_hybrid),
+        ("TruckOnly", cfg_truck),
+        ("Greedy", cfg_greedy),
+        ("GA", cfg_ga),  # 注意：用 cfg_ga，不要用 CFG_GA
+        ("Gurobi", cfg_grb),  # 注意：用 cfg_grb，不要用 CFG_GUROBI
     ]
+
     if target_methods:
-        groups = [g for g in all_groups if g[0] in target_methods]
-        print(f"[SUITE] 🎯 仅运行指定算法: {target_methods}")
+        tm = {str(x).strip().lower() for x in target_methods}
+        groups = [g for g in all_groups if str(g[0]).strip().lower() in tm]
     else:
         groups = all_groups
-        print(f"[SUITE] 🚀 运行完整对比套件 (全量)")
+
     all_rows = []
 
     for gname, cfg in groups:
@@ -711,8 +724,14 @@ def run_compare_suite(
             # 构建写入行
             row = dict(step_res)  # 复制原始数据
             row.update({
-                "method": gname,
-                "seed": int(seed),
+                "method": gname, "algo_seed": int(seed), "dataset_id": base_name,
+                "seed": int(seed), "time_step": row.get("time_step", row.get("scene", row.get("scene_idx", ""))),
+                # 新增：模型变体（默认 hybrid；纯卡车时你在 cfg 里设成 truck_only）
+                # 模型变体：由 force_truck_mode 推断，避免你漏配
+                "model_variant": ("truck_only" if bool(cfg.get("force_truck_mode", False)) else "hybrid"),
+
+                # 算法名：就用本轮组名（gname），最干净
+                "algo_name": gname,
                 # 增强名字提取鲁棒性 (优先取 name, 其次 NAME)
                 "cfg_name": str(cfg.get("name", cfg.get("NAME", ""))),
 
@@ -722,7 +741,6 @@ def run_compare_suite(
                 "cost": obj_cost_calc,  # <--- 修正后的总目标函数值
 
                 # 补充配置参数列 (ALNS/GA 通用)
-                "g0_policy": str(cfg.get("g0_policy", "")) if gname == "G0" else "",
                 "qf_cost_max": cfg.get("qf_cost_max", cfg.get("delta_cost_max", "")),
                 "qf_late_max": cfg.get("qf_late_max", cfg.get("delta_late_max", "")),
                 "remove_fraction": cfg.get("remove_fraction", ""),
@@ -758,109 +776,6 @@ def run_compare_suite(
     print(f"[COMPARE] written: {compare_csv_path} (rows={len(all_rows)})")
     return compare_csv_path
 
-def run_static_truck_only(
-        file_path: str,
-        seed: int,
-        ab_cfg: dict,
-        enable_plot: bool = False,
-        verbose: bool = True
-):
-    """静态-纯卡车基线（不使用无人机，不强制访问基站）。
-
-    目的：和混合模式在“同一 ALNS 框架”下公平对比。
-    做法：
-    - 把所有 customer 标记 force_truck=1
-    - base_to_drone_customers 置空
-    - bases_to_visit 仅包含 central（避免初始路径把所有基站当作必访点）
-    """
-    if seed is not None:
-        ut.set_seed(int(seed))
-
-    ab_cfg = ops.build_ab_cfg(ab_cfg)
-
-    data = read_data(file_path, scenario=0, strict_schema=True)
-
-    # 1) 强制所有客户都走卡车
-    truck_customers = list(getattr(data, "customer_indices", []))
-    for cid in truck_customers:
-        try:
-            data.nodes[cid]["force_truck"] = 1
-        except Exception:
-            pass
-
-    base_to_drone_customers = {}  # 纯卡车：无人机任务为空
-
-    ctx0 = dict(ab_cfg)
-    ctx0["verbose"] = verbose
-    # 中文注释：destroy 下限强度（避免拆了又装回去）；未配置则用默认 3
-    ctx0["min_remove"] = int(ab_cfg.get("min_remove", 3))
-
-    (best_route,
-     best_b2d,
-     _best_cost_internal,
-     _best_truck_dist,
-     _best_drone_dist,
-     _best_total_late,
-     _best_truck_time) = dyn.alns_truck_drone(
-        data,
-        base_to_drone_customers,
-        max_iter=int(ab_cfg.get('alns_max_iter', 1000)),
-        remove_fraction=float(ab_cfg.get("remove_fraction", 0.10)),
-        T_start=float(ab_cfg.get("sa_T_start", ab_cfg.get("T_start", 50.0))),
-        T_end=float(ab_cfg.get("sa_T_end", ab_cfg.get("T_end", 1.0))),
-        alpha_drone=0.3,
-        lambda_late=50.0,
-        truck_customers=truck_customers,
-        use_rl=False,
-        rl_tau=0.5,
-        rl_eta=0.1,
-        bases_to_visit=[data.central_idx],   # 关键：不强制访问所有基站
-        ctx=ctx0
-    )
-
-    # 二次兜底：确保无人机为空、force_truck 不被破坏
-    best_route, best_b2d = sim.enforce_force_truck_solution(data, best_route, best_b2d)
-
-    full_eval = sim.evaluate_full_system(
-        data, best_route, best_b2d,
-        alpha_drone=0.3, lambda_late=50.0,
-        truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
-    )
-
-    rec = {
-        "scene": 0,
-        "t_dec": 0.0,
-        "cost": full_eval["cost"],
-        "base_cost": full_eval.get("truck_dist_eff", full_eval["truck_dist"]) + 0.3 * full_eval["drone_dist"],
-        "penalty": 50.0 * full_eval["total_late"],
-        "lambda_late": 50.0,
-        "truck_dist": full_eval["truck_dist"],
-        "drone_dist": full_eval["drone_dist"],
-        "system_time": full_eval["system_time"],
-        "truck_late": full_eval["truck_late"],
-        "drone_late": full_eval["drone_late"],
-        "total_late": full_eval["total_late"],
-        "num_req": 0,
-        "num_acc": 0,
-        "num_rej": 0
-    }
-
-    if verbose:
-        print("[TRUCK-ONLY] route NODE_ID:", [data.nodes[i].get("node_id", i) for i in best_route])
-        print(f"[TRUCK-ONLY] cost={rec['cost']:.3f}, system_time={rec['system_time']:.3f}h, "
-              f"late={rec['total_late']:.3f}, truck_dist={rec['truck_dist']:.3f}")
-
-    if enable_plot:
-        visualize_truck_drone(
-            data, best_route, best_b2d,
-            title="Static Truck-Only Baseline",
-            show_base_radius=True,
-            decisions=[],
-            save_path=""
-        )
-
-    return rec
-
 def main():
     """
     中文注释：主入口（不再使用命令行参数，所有实验参数集中在此处配置）。
@@ -872,17 +787,18 @@ def main():
     print("[BOOT]", __file__, "DEBUG_LATE=", DEBUG_LATE, "DEBUG_LATE_SCENES=", DEBUG_LATE_SCENES)
 
     # ===== 1) 实验输入 =====
-    # file_path = r"D:\代码\ALNS+DL\OR-Tool\25\nodes_25_seed2023_20260110_201842_promise.csv"
-    # events_path = r"D:\代码\ALNS+DL\OR-Tool\25\events_25_seed2023_20260110_201842.csv"
-    # file_path = r"D:\代码\ALNS+DL\OR-Tool\50\nodes_50_seed2023_20260112_131319_promise.csv"
-    # events_path = r"D:\代码\ALNS+DL\OR-Tool\50\events_50_seed2023_20260112_131319.csv"
-    file_path = r"D:\代码\ALNS+DL\OR-Tool\100\r_150\nodes_100_seed2023_20260124_144032_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\OR-Tool\100\r_150\events_100_seed2023_20260124_144032.csv"
-    # file_path = r"D:\代码\ALNS+DL\nodes_200_seed2023_20260124_151512.csv"
-    # events_path = r"D:\代码\ALNS+DL\events_200_seed2023_20260124_151512.csv"
+    # file_path = r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\nodes_25_seed2023_20260129_164341_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\events_25_seed2023_20260129_164341.csv"
+    # file_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\nodes_50_seed2023_20260129_174717_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\events_50_seed2023_20260129_174717.csv"
+    # file_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\nodes_100_seed2023_20260129_190818_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\events_100_seed2023_20260129_190818.csv"
+    file_path = r"D:\代码\ALNS+DL\nodes_200_seed2023_20260203_142507.csv"
+    events_path = r"D:\代码\ALNS+DL\events_200_seed2023_20260203_142507.csv"
     seed = 2025
     cfg = dict(CFG_D)
-    cfg.update({
+    cfg.update({"use_rl": False,          # <--- 开启 RL
+        "rl_eta": 0.1,
         "reloc_focus_mode": "rej_first",
         "drone_first_pick": "min_obj",
     })
@@ -892,8 +808,11 @@ def main():
     cfg["grb_time_limit"] = 1800  # 每个决策点的 MILP 限时（秒）
     cfg["grb_mip_gap"] = 0.00  # 可选
     cfg["grb_verbose"] = 0  # 可选：0 安静，1 输出更多
-    cfg["trace_converge"] = True
-    cfg["trace_dir"] = "outputs"
+    cfg["trace_converge"] = bool(cfg.get("save_iter_trace", False))
+    if cfg["trace_converge"]:
+        cfg["trace_csv_path"] = "outputs"
+    else:
+        cfg.pop("trace_csv_path", None)
 
     # 动态模式：决策点（小时），t=0 场景系统自动包含
     perturbation_times = [1.0, 2.0]
@@ -907,98 +826,67 @@ def main():
     sim.set_simulation_params(road_factor=road_factor)
     # 并且建议定义本地快捷变量，如果下面有用到
     TRUCK_SPEED_UNITS = sim.get_simulation_params()["TRUCK_SPEED_UNITS"]
-    DRONE_SPEED_UNITS = sim.get_simulation_params()["DRONE_SPEED_UNITS"]
-    NUM_DRONES_PER_BASE = sim.get_simulation_params()["NUM_DRONES_PER_BASE"]
     print(f"[PARAM] TRUCK_ROAD_FACTOR={sim.TRUCK_ROAD_FACTOR:.3f}; TRUCK_SPEED_UNITS={TRUCK_SPEED_UNITS:.3f} units/h (fixed); truck_arc = euclid * {sim.TRUCK_ROAD_FACTOR:.3f}")
 
     # ===== 3) 运行模式开关 =====
-    # 3.1 静态对比：纯卡车 vs 混合（只跑 scene=0，不跑动态扰动）
-    RUN_STATIC_COMPARE = False
-
-    # 3.2 批量对比：多 seed + 多 CFG（使用同一 events.csv 即可保证同一请求流）
-    RUN_BATCH = False
-
-    # 3.3 最小可复现实验：road_factor 1.0 vs 1.5 应显著改变 system_time / late
-    RUN_ROAD_SANITY = False
-
     # 3.4 对照组套件：G0–G3（动态对比）
-    RUN_COMPARE_SUITE = True
+    RUN_COMPARE_SUITE = False
 
-    # ===== 4) road sanity =====
-    if RUN_ROAD_SANITY:
-        for rf in [1.0, 1.5]:
-            sim.set_simulation_params(rf)
-            results = run_one(
-                file_path=file_path, seed=seed, ab_cfg=cfg,
-                perturbation_times=perturbation_times,
-                enable_plot=False, verbose=False,
-                events_path=events_path, decision_log_path=''
-            )
-            r0 = results[0]
-            print(f"[SANITY] rf={rf:.1f} speed_units={TRUCK_SPEED_UNITS:.3f} truck_dist={r0['truck_dist']:.3f} drone_dist={r0['drone_dist']:.3f} system_time={r0['system_time']:.3f} total_late={r0['total_late']:.3f} cost={r0['cost']:.3f}")
-        return
-
-    # ===== 5) 静态纯卡车 vs 混合对比 =====
-    if RUN_STATIC_COMPARE:
-        # 只跑静态场景：不加任何决策点
-        pert_static = []
-
-        # 5.1 混合模式（原 run_one）
-        sim.set_simulation_params(road_factor=road_factor)
-        res_mixed = run_one(
-            file_path=file_path, seed=seed, ab_cfg=cfg,
-            perturbation_times=pert_static,
-            enable_plot=False, verbose=False,
-            events_path=events_path, decision_log_path=''
-        )[0]
-
-        # 5.2 纯卡车（不访问基站、不派无人机）
-        sim.set_simulation_params(road_factor=road_factor)
-        res_truck = run_static_truck_only(
-            file_path=file_path, seed=seed, ab_cfg=cfg,
-            enable_plot=False, verbose=False
-        )
-
-        print("\n===== STATIC COMPARE (scene=0) =====")
-        print(f"[MIXED]      cost={res_mixed['cost']:.3f}  truck={res_mixed['truck_dist']:.3f}  drone={res_mixed['drone_dist']:.3f}  time={res_mixed['system_time']:.3f}  late={res_mixed['total_late']:.3f}")
-        print(f"[TRUCK-ONLY] cost={res_truck['cost']:.3f}  truck={res_truck['truck_dist']:.3f}  drone={res_truck['drone_dist']:.3f}  time={res_truck['system_time']:.3f}  late={res_truck['total_late']:.3f}")
-        return
-
-    # ===== 6) 批量对比：多 seed + 多 cfg（不使用回放）=====
-    if RUN_BATCH:
-        cfgs = [CFG_A, CFG_D]
-        seeds = [2021, 2022, 2023]  # 你也可以先用 [2025] 小跑验证
-        enable_plot_batch = False
-        verbose_batch = False
-        # 公平性说明：
-        # - events_path 非空：所有配置共享同一离线请求流（推荐/最公平）
-        # - events_path 为空：仅运行场景0（无动态请求）；若要动态对比请提供 events_path
-        for sd in seeds:
-            for _cfg in cfgs:
-                sim.set_simulation_params(road_factor=road_factor)
-                res = run_one(
-                    file_path=file_path, seed=sd, ab_cfg=_cfg,
-                    perturbation_times=perturbation_times,
-                    enable_plot=enable_plot_batch, verbose=verbose_batch,
-                    events_path=events_path, decision_log_path=''
-                )
-                r0 = res[0]
-                print(f"[BATCH] seed={sd} cfg={_cfg.get('name','?')} cost0={r0['cost']:.3f} time0={r0['system_time']:.3f} late0={r0['total_late']:.3f}")
-        return
-    # ===== 6.5) 对照组套件：G0–G3 =====
     if RUN_COMPARE_SUITE:
-        # 可选值: "Greedy", "TruckOnly", "GA", "Proposed"
-        # 留空 [] 或 None 表示跑所有
-        METHODS_TO_RUN = ["Proposed"]
-        run_compare_suite(
-            file_path=file_path, seed=seed, base_cfg=cfg,
-            perturbation_times=perturbation_times,
-            events_path=events_path,
-            out_dir='outputs',
-            enable_plot=False,
-            verbose=True, target_methods=METHODS_TO_RUN
-        )
+        import os, time, csv, copy
+
+        # 你要跑的 5 个 algo_seed
+        SEEDS_TO_RUN = [2021, 2022, 2023, 2024, 2025]
+
+        # 选择对比层面：模型(model) 或 算法(algo)
+        SUITE_LEVEL = "model"  # "model" 或 "algo"
+
+        if SUITE_LEVEL == "model":
+            # 模型层面：纯卡车 vs 混合（主方法）
+            TARGET_METHODS = ["TruckOnly", "Proposed"]
+        elif SUITE_LEVEL == "algo":
+            # 算法层面：固定混合模型，对比多算法
+            TARGET_METHODS = ["Gurobi", "Greedy", "GA", "Proposed"]
+        else:
+            TARGET_METHODS = None  # 全跑（一般不建议）
+
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        suite_dir = os.path.join("outputs", "suites", f"suite_{SUITE_LEVEL}_{base_name}_{ts}")
+        os.makedirs(suite_dir, exist_ok=True)
+
+        index_rows = []
+        for algo_seed in SEEDS_TO_RUN:
+            run_dir = os.path.join(suite_dir, f"seed_{algo_seed}")
+            os.makedirs(run_dir, exist_ok=True)
+
+            # 深拷贝，避免 cfg 串组污染
+            cfg_run = copy.deepcopy(cfg)
+            print("[SUITE] TARGET_METHODS =", TARGET_METHODS)
+            csv_path = run_compare_suite(
+                file_path=file_path,
+                seed=algo_seed,
+                base_cfg=cfg_run,
+                perturbation_times=perturbation_times,
+                events_path=events_path,
+                out_dir=run_dir,
+                enable_plot=False,
+                verbose=False,
+                target_methods=TARGET_METHODS,
+            )
+            index_rows.append({"algo_seed": algo_seed, "csv": os.path.relpath(csv_path, suite_dir)})
+
+        # 写总索引：你后续画图只需要读这个
+        index_path = os.path.join(suite_dir, "suite_index.csv")
+        with open(index_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=["algo_seed", "csv"])
+            w.writeheader()
+            w.writerows(index_rows)
+
+        print("[SUITE] suite_dir =", suite_dir)
+        print("[SUITE] index =", index_path)
         return
+
     # ===== 7) 正常动态运行（你平时跑的模式）=====
 
     results = run_one(

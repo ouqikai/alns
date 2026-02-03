@@ -30,6 +30,8 @@ from typing import Dict, Tuple, List, Optional, Set, Any
 import pandas as pd
 import gurobipy as gp
 from gurobipy import GRB
+import os
+from datetime import datetime
 
 # 可选：可视化依赖（没有 matplotlib 也能跑 MILP）
 try:

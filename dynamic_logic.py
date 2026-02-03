@@ -12,12 +12,7 @@ import pandas as pd
 import milp_solver as grb   # 你把 01162113.py 复制改名后的模块
 import time
 import ga_solver
-# === 补充 dprint 定义 ===
-DEBUG = False  # 如果你想看详细调试信息，改成 True
 
-def dprint(*args, **kwargs):
-    if DEBUG:
-        print(*args, **kwargs)
 def add_virtual_truck_position_node(data, pos):
     """
     在 data 中新增一个表示“当前卡车位置”的虚拟节点，并返回其索引。
@@ -151,14 +146,6 @@ def get_drone_served_before_t(full_b2d_cur, full_finish_cur, t, eps=1e-9):
             if full_finish_cur.get(c, float('inf')) <= t + eps:
                 served.add(c)
     return sorted(served)
-
-def _decision_tag(decision_item):
-    """从 decisions 的元素中提取 'ACCEPT...' 或 'REJECT...' 标记（兼容历史格式）。"""
-    if isinstance(decision_item, (list, tuple)):
-        for x in decision_item:
-            if isinstance(x, str) and (x.startswith("ACCEPT") or x.startswith("REJECT")):
-                return x
-    return ""
 
 def _merge_prefix_suffix(prefix_route, suffix_route):
     """将已执行前缀与新求解后缀拼接为全局路线（去重连接点）。"""
@@ -503,10 +490,6 @@ def apply_relocations_for_decision_time(
     if data_new.central_idx not in base_indices_all:
         base_indices_all.insert(0, data_new.central_idx)
 
-    future_bases = [b for b in base_indices_all
-                    if arrival_times.get(b, float('inf')) > decision_time + 1e-9]
-    dprint("[debug] future_bases(node_id)=", [data_new.nodes[b]['node_id'] for b in future_bases])
-
     # 这里传 None => 使用全部基站计算最近基站；不会因 future_bases 为空而崩溃
     recompute_cost_and_nearest_base(data_new, feasible_bases=None)
 
@@ -525,7 +508,6 @@ def quick_filter_relocations(data_cur, data_prelim, full_route_cur, full_b2d_cur
     返回：data_next, decisions_filtered, qf_deltas
       - qf_deltas[cid] = {"D_COST","D_LATE_PROM","D_LATE_EFF"}
     """
-    debug = bool(globals().get("DEBUG_QUICK_FILTER", False))
 
     # ---------- 小工具：在 b2d 里找客户归属基站 ----------
     def _find_base_of_client(b2d, cid):
@@ -761,31 +743,11 @@ def quick_filter_relocations(data_cur, data_prelim, full_route_cur, full_b2d_cur
         if (upd["base_lock"] is None) and (cid in route_trial):
             # 可选：debug 下比较尾插增量 vs 最优插入增量
             tail_delta = None
-            if debug:
-                try:
-                    pos0 = route_trial.index(cid)
-                    a0 = route_trial[pos0 - 1]
-                    b0 = route_trial[pos0 + 1]
-                    tail_delta = float(data_trial.costMatrix[int(a0)][int(cid)]) + \
-                                 float(data_trial.costMatrix[int(cid)][int(b0)]) - \
-                                 float(data_trial.costMatrix[int(a0)][int(b0)])
-                except Exception:
-                    tail_delta = None
 
             route_trial2, old_pos, best_pos, best_delta = _cheapest_reinsert_for_truck(
                 data_trial, route_trial, cid, min_insert_pos, central_idx
             )
             route_trial = route_trial2
-
-            if debug and (old_pos is not None) and (best_pos is not None) and (best_pos != old_pos):
-                nid = data_cur.nodes[cid].get("node_id", cid)
-                if tail_delta is not None:
-                    print(f"[QF-INS] cid={cid} nid={nid} old_pos={old_pos} best_pos={best_pos} "
-                          f"tailΔ={tail_delta:.3f} bestΔ={best_delta:.3f} improve={tail_delta - best_delta:.3f} "
-                          f"min_pos={min_insert_pos}")
-                else:
-                    print(f"[QF-INS] cid={cid} nid={nid} old_pos={old_pos} best_pos={best_pos} "
-                          f"bestΔ={best_delta:.3f} min_pos={min_insert_pos}")
 
         # 4) 评估 trial
         res1 = sim.evaluate_full_system(
@@ -810,18 +772,6 @@ def quick_filter_relocations(data_cur, data_prelim, full_route_cur, full_b2d_cur
             "D_LATE_PROM": float(d_late_prom),
             "D_LATE_EFF": float(d_late_eff),
         }
-
-        if debug:
-            nid = data_cur.nodes[cid].get("node_id", cid)
-            new_base = _find_base_of_client(b2d_trial, cid)
-            typ0 = f"drone@base{old_base}" if old_base is not None else "truck"
-            typ1 = f"drone@base{new_base}" if new_base is not None else "truck"
-            print(
-                f"[QF] cid={cid} nid={nid} {typ0}->{typ1} "
-                f"force={upd_force} base_lock={upd_base_lock} in_route0={old_in_route} "
-                f"Δtruck={d_truck:.3f} Δdrone={d_drone:.3f} Δlate_eff={d_late_eff:.3f} "
-                f"Δlate_prom={d_late_prom:.3f} Δcost={d_cost:.3f}"
-            )
 
         # 阈值判定（保持原先 quick_filter 策略：cost 与 late_eff 双阈值）
         if (d_cost > float(delta_cost_max)) or (d_late_eff > float(delta_late_max)):
@@ -860,19 +810,21 @@ def quick_filter_relocations(data_cur, data_prelim, full_route_cur, full_b2d_cur
 
     return data_work, decisions_filtered, qf_deltas, route_work, b2d_work, res_work
 
-def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fraction=None, T_start=None, T_end=None, alpha_drone=0.3, lambda_late=50.0, truck_customers=None, use_rl=False,
+
+def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fraction=None, T_start=None, T_end=None,
+                     alpha_drone=0.3, lambda_late=50.0, truck_customers=None, use_rl=False,
                      rl_tau=0.5, rl_eta=0.1, start_idx=None, start_time: float = 0.0, bases_to_visit=None,
                      ctx=None):
     if ctx is None:
         ctx = {}
 
-        # 1) drone_range：自动兼容你工程里的常量名
-        if "drone_range" not in ctx or ctx["drone_range"] is None:
-            # 修改点：直接从 sim 模块获取
-            ctx["drone_range"] = sim.DRONE_RANGE_UNITS
+    # 1) drone_range：自动兼容你工程里的常量名
+    if "drone_range" not in ctx or ctx["drone_range"] is None:
+        # 修改点：直接从 sim 模块获取
+        ctx["drone_range"] = sim.DRONE_RANGE_UNITS
 
-        if ctx["drone_range"] is None:
-            raise RuntimeError("[GUARD] 未找到无人机航程常量：请检查 sim.DRONE_RANGE_UNITS")
+    if ctx["drone_range"] is None:
+        raise RuntimeError("[GUARD] 未找到无人机航程常量：请检查 sim.DRONE_RANGE_UNITS")
     # 2) bases_to_visit：若没传(None)，就默认所有基站；若传了空列表[]，就保持为空
     if bases_to_visit is None:  # <--- 修改这里：只在 None 时才自动填充
         all_bases = [i for i, n in enumerate(data.nodes) if n.get("node_type") == "base"]
@@ -905,7 +857,6 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
     must_cover_set |= set(ctx.get("force_truck_set", set()))
     ctx["must_cover_set"] = set(must_cover_set)
 
-
     # 1) 初始卡车路径
     if start_idx is None:
         start_idx_used = data.central_idx
@@ -929,18 +880,16 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
             bases_to_visit=ctx["bases_to_visit"]
         )
 
-    dprint("[debug] init_route NODE_ID:", [data.nodes[i]['node_id'] for i in current_route])
-
     # 2) 当前/最优的 base_to_drone 也要拷贝
     current_b2d = {b: lst[:] for b, lst in base_to_drone_customers.items()}
 
     (current_cost,
-     current_truck_dist,
-     current_drone_dist,
-     current_truck_late,
-     current_drone_late,
-     current_total_late,
-     current_truck_time) = sim.evaluate_truck_drone_with_time(
+    current_truck_dist,
+    current_drone_dist,
+    _,
+    _,
+    current_total_late,
+    current_truck_time) = sim.evaluate_truck_drone_with_time(
         data,
         current_route,
         current_b2d,
@@ -959,60 +908,23 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
     best_drone_dist = current_drone_dist
     best_total_late = current_total_late
     best_truck_time = current_truck_time
-    init_cost = current_cost
-    init_late = current_total_late
+    best_iter = 0  # 中文注释：记录最近一次刷新全局最优(best_cost)的迭代号
 
-
-    # ===================== 收敛曲线追踪（A：best_cost_dist vs iteration） =====================
-    # 中文注释：评价成本 cost_dist 不含迟到惩罚，仅用于画收敛曲线/对比，不改变 ALNS 求解逻辑。
-    trace_enabled = bool(ctx.get("trace_converge", False))
-    trace_csv_path = ctx.get("trace_csv_path", None)
-    trace_rows = []
-
-    def _flush_converge_trace():
-        """中文注释：把 best-so-far 收敛轨迹写出到 CSV。
-        说明：这是“记录/可视化”功能，不影响求解逻辑。
-        """
-        if (not trace_enabled) or (not trace_csv_path):
-            return
-        try:
-            os.makedirs(os.path.dirname(str(trace_csv_path)) or '.', exist_ok=True)
-            with open(trace_csv_path, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(
-                    f,
-                    fieldnames=["iter", "best_cost_dist", "best_total_late", "best_truck_dist", "best_drone_dist"],
-                )
-                w.writeheader()
-                for r in trace_rows:
-                    w.writerow(r)
-        except Exception as _e:
-            # 中文注释：默认 verbose=False 不打印，避免污染终端；需要时可把 verbose=True 查看。
-            if ctx.get('verbose', False):
-                print('[WARN] converge trace save failed:', _e)
     # best_cost_dist_sofar：从迭代0起，记录“所有通过护栏的候选解”中 cost_dist 的最小值（best-so-far）。
     best_cost_dist_sofar = float(best_truck_dist + alpha_drone * best_drone_dist)
     best_late_for_bestdist = float(best_total_late)
     best_truck_dist_for_bestdist = float(best_truck_dist)
     best_drone_dist_for_bestdist = float(best_drone_dist)
-    if trace_enabled:
-        trace_rows.append({
-            "iter": 0,
-            "best_cost_dist": best_cost_dist_sofar,
-            "best_total_late": best_late_for_bestdist,
-            "best_truck_dist": float(best_truck_dist_for_bestdist),
-                "best_drone_dist": float(best_drone_dist_for_bestdist),
-            })
+
     if ctx.get("verbose", False):
-        print(f"初始: 成本={current_cost:.3f}, 卡车距={current_truck_dist:.3f}, 无人机距={current_drone_dist:.3f}, 总迟到={current_total_late:.3f}")
+        print(
+            f"初始: 成本={current_cost:.3f}, 卡车距={current_truck_dist:.3f}, 无人机距={current_drone_dist:.3f}, 总迟到={current_total_late:.3f}")
 
     # === RL: 每个算子的得分（Q 值） ===
     n_inner = len(current_route) - 2
     if n_inner <= 0:
         # 兜底：仍需保证 force_truck 约束一致
         best_route, best_b2d = sim.enforce_force_truck_solution(data, best_route, best_b2d)
-
-        # ===================== 收敛曲线写出（CSV） =====================
-        _flush_converge_trace()
 
         return best_route, best_b2d, best_cost, best_truck_dist, best_drone_dist, best_total_late, best_truck_time
     # ---------- ctx 处理：保留调用方传入的 dict 引用，用于回传算子统计 ----------
@@ -1034,42 +946,111 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
               "n_destroy=", len(DESTROYS),
               "n_repair=", len(REPAIRS),
               "scene_idx=", ctx.get("scene_idx", None))
+
     # [新增] 早停参数
     max_no_improve = int(ctx.get("max_no_improve", 200))  # 默认 200 代无改进就停止
     no_improve_cnt = 0
-    hit_stat = {}  # key: destroy_name -> dict(removed=0, hit=0, calls=0)
-    op_stat = {}  # destroy -> dict(calls, accepts, best_hits, best_gain)
 
+    # ================= [State-Aware RL INIT] =================
+    # 初始化：区分 Normal (0) 和 Critical (1) 两种状态
+    # 状态定义：0 = 无迟到(Late <= 1e-3); 1 = 有迟到(Late > 1e-3)
+    INITIAL_WEIGHT = 10.0
+
+    # 结构：weights[state_id][op_name]
+    # 这里演示非 Paired 模式（最常用）
+    d_weights_pool = {
+        0: {op.__name__: INITIAL_WEIGHT for op in DESTROYS},  # Normal
+        1: {op.__name__: INITIAL_WEIGHT for op in DESTROYS}  # Critical
+    }
+    r_weights_pool = {
+        0: {op.__name__: INITIAL_WEIGHT for op in REPAIRS},
+        1: {op.__name__: INITIAL_WEIGHT for op in REPAIRS}
+    }
+    # 可选：人工注入先验知识（Bias）
+    # 在 Critical 状态下，给“迟到修复”算子更高的初始权重，迫使算法优先消迟到
+    if "R_late_repair_reinsert" in r_weights_pool[1]:
+        r_weights_pool[1]["R_late_repair_reinsert"] = 50.0  # 强力推荐
+    if "R_greedy_only" in r_weights_pool[1]:
+        r_weights_pool[1]["R_greedy_only"] = 20.0  # 迟到时纯卡车贪婪插入也比较稳健
+
+    # Paired 模式支持（以防配置切换）
+    pair_weights_pool = {}
+    if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
+        pair_weights_pool = {
+            0: {i: INITIAL_WEIGHT for i in range(len(ALLOWED_PAIRS))},
+            1: {i: INITIAL_WEIGHT for i in range(len(ALLOWED_PAIRS))}
+        }
+
+    # 定义得分参数 (Sigma)
+    SIGMA_1 = 20.0  # 全局更优
+    SIGMA_2 = 10.0  # 局部更优（被接受）
+    SIGMA_3 = 0.0  # 变差但被接受
+    SIGMA_4 = 0.0  # 被拒绝
+    op_stat = {}
     for it in range(1, max_iter + 1):
         alpha = it / max_iter
         T = T_start * (1 - alpha) + T_end * alpha
 
         # --- 记录旧的 current_cost / best_cost，用来算奖励 ---
         old_current_cost = current_cost
+        old_current_late = current_total_late
         old_best_cost = best_cost
 
-        # 1) 选择 destroy / repair（先都用 random，后面再加权/加RL）
-        if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
-            D, R = random.choice(ALLOWED_PAIRS)
+        # 1. 感知当前状态 (State Perception)
+        # 如果总迟到 > 0.001，认为处于 Critical 状态，否则 Normal
+        current_state_id = 1 if current_total_late > 1e-3 else 0
+
+        # 2. 根据状态获取对应的权重表
+        curr_d_w = d_weights_pool[current_state_id]
+        curr_r_w = r_weights_pool[current_state_id]
+        curr_pair_w = pair_weights_pool.get(current_state_id, {})
+
+        # === [RL-SELECT] 自适应选择算子 ===
+        selected_pair_idx = -1
+
+        if use_rl:
+            if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
+                # 轮盘赌选择 Pair (基于当前状态权重)
+                total_w = sum(curr_pair_w.values())
+                probs = [curr_pair_w[i] / total_w for i in range(len(ALLOWED_PAIRS))]
+                selected_pair_idx = np.random.choice(len(ALLOWED_PAIRS), p=probs)
+                D, R = ALLOWED_PAIRS[selected_pair_idx]
+            else:
+                # 分别轮盘赌选择 D 和 R (基于当前状态权重)
+                w_d_sum = sum(curr_d_w.values())
+                p_d = [curr_d_w[op.__name__] / w_d_sum for op in DESTROYS]
+                D = np.random.choice(DESTROYS, p=p_d)
+
+                w_r_sum = sum(curr_r_w.values())
+                p_r = [curr_r_w[op.__name__] / w_r_sum for op in REPAIRS]
+                R = np.random.choice(REPAIRS, p=p_r)
         else:
-            D = random.choice(DESTROYS)
-            R = random.choice(REPAIRS)
+            # 原有的随机逻辑 (保持不变作为 fallback)
+            if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
+                D, R = random.choice(ALLOWED_PAIRS)
+            else:
+                D = random.choice(DESTROYS)
+                R = random.choice(REPAIRS)
 
         dname = getattr(D, "__name__", "D?")
         rname = getattr(R, "__name__", "R?")
-        # 统计建议按 (destroy, repair) 粒度记录，否则看不出“谁和谁搭配导致 late_fail/accept 变化”
-        op_key = f"{dname}::{rname}"
-        s = op_stat.setdefault(op_key, {})
-        # 兜底补齐（避免 KeyError）
-        s.setdefault("calls", 0)
-        s.setdefault("accepts", 0)
-        s.setdefault("best_hits", 0)
-        s.setdefault("best_gain", 0.0)
-        s.setdefault("late_fail", 0)
-        s.setdefault("late_excess", 0.0)   # late_hard 被超出的总量（用于定位“多严重”）
-        s.setdefault("repair_fail", 0)     # repair 返回 None 的次数（用于定位“可行性问题”）
-        s.setdefault("cover_fail", 0)     # 漏点导致覆盖性失败次数
-        s.setdefault("sa_reject", 0)
+        # ===== 统计：每个 (Destroy, Repair) 一份计数器 =====
+        op_key = (dname, rname)
+        s = op_stat.get(op_key)
+        if s is None:
+            s = op_stat[op_key] = {
+                "calls": 0,
+                "accepts": 0,  # SA 接受次数（你现在用的 accept）
+                "repair_fail": 0,
+                "cover_fail": 0,
+                "late_delta_fail": 0,
+                "late_delta_excess": 0.0,
+                "late_fail": 0,
+                "late_excess": 0.0,
+                "sa_reject": 0,
+                "best_hits": 0,
+                "best_gain": 0.0,
+            }
         s["calls"] += 1
 
         # 2) 生成候选解
@@ -1078,30 +1059,7 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
         iter_ctx["num_remove"] = max(min_remove, int(remove_fraction * n_inner))
         iter_ctx["protected_nodes"] = protected_nodes
 
-        # 后面你做定制算子时，在 ctx 里加 C_moved_accept / C_boundary / bases_to_visit 等
-
         destroyed_route, destroyed_b2d, removed_customers = D(data, current_route, current_b2d, iter_ctx)
-        # === B1: destroy 命中率统计（只在 verbose=True 时打印，套件不刷屏）===
-        if iter_ctx.get("verbose", False):
-            removed_set = set(removed_customers or [])
-            if len(removed_set) > 0:
-                C1 = set(iter_ctx.get("C_moved_accept", set()))
-                C2 = set(iter_ctx.get("C_force_truck", set()))
-                C3 = set(iter_ctx.get("C_boundary", set()))
-                hit = len(removed_set & (C1 | C2 | C3))
-
-                name = getattr(D, "__name__", "D?")
-                hs = hit_stat.setdefault(name, {"removed": 0, "hit": 0, "calls": 0})
-                hs["removed"] += len(removed_set)
-                hs["hit"] += hit
-                hs["calls"] += 1
-
-                # if it % 100 == 0:
-                #     print("[HIT-SUMMARY] it=", it)
-                #     for k, v in sorted(hit_stat.items()):
-                #         rate = v["hit"] / max(1, v["removed"])
-                #         print(
-                #             f"  {k:18s} calls={v['calls']:4d} removed={v['removed']:4d} hit={v['hit']:4d} rate={rate:.2f}")
 
         cand_route, cand_b2d = R(data, destroyed_route, destroyed_b2d, removed_customers, iter_ctx)
 
@@ -1112,15 +1070,14 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
         # 强制约束修复（最终兜底）
         cand_route, cand_b2d = sim.enforce_force_truck_solution(data, cand_route, cand_b2d)
 
-
         # ---------- 覆盖性护栏：候选解不得漏掉 must_cover_set 里的客户 ----------
         must_cover = set(iter_ctx.get("must_cover_set", set()))
         if must_cover:
-            route_cust = {i for i in cand_route if 0 <= i < len(data.nodes) and data.nodes[i].get("node_type") == "customer"}
+            route_cust = {i for i in cand_route if
+                          0 <= i < len(data.nodes) and data.nodes[i].get("node_type") == "customer"}
             drone_cust = {int(c) for _b, _lst in cand_b2d.items() for c in _lst}
             missing_cov = must_cover - (route_cust | drone_cust)
             if missing_cov:
-                s.setdefault("cover_fail", 0)
                 s["cover_fail"] += 1
                 continue
 
@@ -1145,37 +1102,19 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
 
         late_abs = float(iter_ctx.get("late_hard", float("inf")))
         late_delta = iter_ctx.get("late_hard_delta", None)
-        # 1) 迟到“增量”硬护栏：避免因总迟到阈值过小导致候选几乎全被丢弃
+        # 1) 迟到“增量”硬护栏
         if late_delta is not None:
             late_delta = float(late_delta)
             inc = float(cand_total_late - current_total_late)
             if inc > late_delta + 1e-9:
-                s.setdefault("late_delta_fail", 0)
-                s.setdefault("late_delta_excess", 0.0)
                 s["late_delta_fail"] += 1
                 s["late_delta_excess"] += float(inc - late_delta)
                 continue
-        # 2) 迟到“绝对值”硬护栏：兜底避免迟到爆炸
+        # 2) 迟到“绝对值”硬护栏
         if cand_total_late > late_abs + 1e-9:
             s["late_fail"] += 1
             s["late_excess"] += float(cand_total_late - late_abs)
             continue
-
-        # ---- 收敛曲线：在通过护栏的候选解上，更新 best_cost_dist_sofar（不依赖 SA 是否接受） ----
-        if trace_enabled:
-            cand_cost_dist = float(cand_truck_dist + alpha_drone * cand_drone_dist)
-            if cand_cost_dist < best_cost_dist_sofar - 1e-12:
-                best_cost_dist_sofar = cand_cost_dist
-                best_late_for_bestdist = float(cand_total_late)
-                best_truck_dist_for_bestdist = float(cand_truck_dist)
-                best_drone_dist_for_bestdist = float(cand_drone_dist)
-            trace_rows.append({
-                "iter": int(it),
-                "best_cost_dist": float(best_cost_dist_sofar),
-                "best_total_late": float(best_late_for_bestdist),
-                "best_truck_dist": float(best_truck_dist_for_bestdist),
-                "best_drone_dist": float(best_drone_dist_for_bestdist),
-            })
 
         # === 4) SA 接受准则 ===
         delta = cand_cost - current_cost
@@ -1195,8 +1134,14 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
             current_truck_time = cand_truck_time
             s["accepts"] += 1
 
-            if cand_cost < best_cost:
-                gain = best_cost - cand_cost  # 先用旧 best_cost 计算收益（>0）
+            if cand_cost < best_cost - 1e-6:
+                gain = best_cost - cand_cost
+                best_iter = it
+                if ctx.get("verbose", False):
+                    # 中文注释：不走 RL 评分也要看到“真实 best 更新”发生在哪一代
+                    print(f"\n[BEST-UPDATE] it={it} old_best={old_best_cost:.6f} new_best={cand_cost:.6f} "
+                          f"delta={(old_best_cost - cand_cost):.3e} D={dname} R={rname}")
+
                 best_route = current_route[:]
                 best_b2d = {b: lst[:] for b, lst in current_b2d.items()}
                 best_cost = cand_cost
@@ -1209,35 +1154,61 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
                 s["best_gain"] += gain
                 no_improve_cnt = 0
             else:
-                # [新增] 没找到全局更优解（哪怕被 SA 接受了也不算），计数器 +1
                 no_improve_cnt += 1
-            # [新增] 检查早停条件
+
             if no_improve_cnt >= max_no_improve:
                 if ctx.get("verbose", False):
-                    print(f"    [EARLY-STOP] ALNS 在 {it} 代触发早停 (连续 {max_no_improve} 代无全局改进)")
+                    print(f"    [EARLY-STOP] ALNS 在 {it} 代触发早停 (连续 {max_no_improve} 次无全局改进)；最近best发生在 it={best_iter}")
                 break
         else:
-            # 仅统计：SA 没接受（不改变任何决策逻辑）
             s["sa_reject"] += 1
-    # 打印偏爱算子
-    dprint("[debug] best_route NODE_ID:", [data.nodes[i]['node_id'] for i in best_route])
 
-    # 返回前再做一次兜底约束（避免 force_truck 客户被算子转走导致后续场景丢失）
+        # === [RL-UPDATE] 计算得分并更新权重 (State-Aware) ===
+        current_score = SIGMA_4  # 默认拒绝
+
+        if accept:
+            if cand_cost < old_best_cost - 1e-6:
+                current_score = SIGMA_1  # 全局最优
+            elif cand_cost < old_current_cost - 1e-6:
+                current_score = SIGMA_2  # 局部更优
+            else:
+                current_score = SIGMA_3  # 变差但接受
+
+        # [State-Aware Bonus] 如果处于 Critical 状态且成功降低了迟到，给予额外重奖
+        if accept and (current_state_id == 1) and (cand_total_late < old_current_late - 1e-6):
+            current_score += 15.0
+
+        if use_rl:
+            W_MIN = 0.1
+            # 只更新当前 State 对应的权重表
+            if PAIRING_MODE == "paired" and ALLOWED_PAIRS and selected_pair_idx != -1:
+                # 更新 Pair 权重
+                old_w = curr_pair_w[selected_pair_idx]
+                curr_pair_w[selected_pair_idx] = max(W_MIN, (1 - rl_eta) * old_w + rl_eta * current_score)
+            else:
+                # 分别更新 D 和 R 权重
+                # Update D
+                old_dw = curr_d_w[dname]
+                curr_d_w[dname] = max(W_MIN, (1 - rl_eta) * old_dw + rl_eta * current_score)
+                # Update R
+                old_rw = curr_r_w[rname]
+                curr_r_w[rname] = max(W_MIN, (1 - rl_eta) * old_rw + rl_eta * current_score)
+
+            # Debug打印 (Optional)
+            if it % 50 == 0 and ctx.get("verbose", False):
+                print(
+                    f"\n[RL-CHECK] Iter {it} | State: {current_state_id} (Late={current_total_late:.3f}) | Score={current_score}")
+                # 打印当前状态下前 3 个高权重算子
+                if PAIRING_MODE != "paired":
+                    top_r = sorted(curr_r_w, key=curr_r_w.get, reverse=True)[:3]
+                    print(f"  Top R (State {current_state_id}):", [(k, round(curr_r_w[k], 1)) for k in top_r])
+            # 只要得了20分，强制打印，不管是不是50的倍数
+            if current_score == SIGMA_1 and ctx.get("verbose", False):
+                print(f"\n[RL-CHECK] Iter {it} !!! NEW BEST !!! Score=20.0")
+    # 返回前再做一次兜底约束
     best_route, best_b2d = sim.enforce_force_truck_solution(data, best_route, best_b2d)
 
-    # ---------- 回传算子统计：用于消融验证（不影响求解逻辑） ----------
-    try:
-        ctx_in["__op_stat"] = op_stat
-        ctx_in["__hit_stat"] = hit_stat
-    except Exception:
-        pass
-
-    # ===================== 收敛曲线写出（CSV） =====================
-    # 中文注释：正常迭代结束/提前结束（非 n_inner<=0）也需要写出；否则用户看不到 converge_*.csv。
-    _flush_converge_trace()
     return best_route, best_b2d, best_cost, best_truck_dist, best_drone_dist, best_total_late, best_truck_time
-
-
 # dynamic_logic.py (追加在末尾)
 
 def run_decision_epoch(
@@ -1270,9 +1241,6 @@ def run_decision_epoch(
     # 0. 随机种子同步
     if seed is not None:
         ut.set_seed(int(seed) + int(scene_idx))
-
-    # 对照组/实验组标识：默认 G3（Full）
-    method = str(ab_cfg.get("method", ab_cfg.get("compare_group", "G3"))).strip().upper()
 
     if verbose:
         print(f"\n===== 场景 {scene_idx}: 决策时刻 t = {decision_time:.2f} h 应用位置变更后 =====")
@@ -1370,32 +1338,18 @@ def run_decision_epoch(
     decisions_raw = []
     req_clients = []
 
-    # G0：不应用变更，全部拒绝（route/b2d/坐标均不更新）
-    if method == "G0":
-        data_next = data_cur
-        decisions = []
-        qf_deltas = {}
-        qf_route_full, qf_b2d_full, qf_eval_preplan = None, None, None
-        if len(req_override) > 0:
-            for cid in req_override:
-                cid = int(cid)
-                nx, ny = predefined_xy.get(cid, (float(data_cur.nodes[cid].get('x', 0.0)), float(data_cur.nodes[cid].get('y', 0.0))))
-                decisions.append((cid, "REJECT", float(nx), float(ny), "G0 No-Replan：全部拒绝请求，且不更新路线/坐标"))
-        # req_clients 保持为空：后续不会进入 quick_filter/ALNS
-        req_clients = []
-    else:
-        if len(req_override) > 0:
-            data_cur._offline_ev_meta = _ev_meta
-            data_prelim, decisions_raw, req_clients = apply_relocations_for_decision_time(
-                data_cur, t_prev, decision_time,
-                full_depart_cur, full_finish_cur, full_arrival_cur,
-                client_to_base_cur,
-                req_override, predefined_xy, predefined_types, predefined_delta_avail
-            )
-            try:
-                data_cur._offline_ev_meta = {}
-            except Exception:
-                pass
+    if len(req_override) > 0:
+        data_cur._offline_ev_meta = _ev_meta
+        data_prelim, decisions_raw, req_clients = apply_relocations_for_decision_time(
+            data_cur, t_prev, decision_time,
+            full_depart_cur, full_finish_cur, full_arrival_cur,
+            client_to_base_cur,
+            req_override, predefined_xy, predefined_types, predefined_delta_avail
+        )
+        try:
+            data_cur._offline_ev_meta = {}
+        except Exception:
+            pass
 
     # 4. 判断是否提前结束 (Early Stop)
     unfinished_drone_exist = any(
@@ -1407,36 +1361,32 @@ def run_decision_epoch(
         return {'break': True}
 
     # 5. 快速筛选 (Quick Filter) & 构造最终 Decisions（仅对非 G0 启用）
-    if method != "G0":
-        if len(req_clients) == 0:
-            # 无新请求，直接沿用
-            data_next = data_cur
-            decisions = []
-            qf_deltas = {}
-            qf_route_full, qf_b2d_full, qf_eval_preplan = None, None, None
-        else:
-            # 中文注释：从 ab_cfg 读取 quick_filter 关键参数；未配置则使用默认值。
-            qf_cost_max = float(ab_cfg.get("qf_cost_max", ab_cfg.get("delta_cost_max", 30.0)))
-            qf_late_max = float(ab_cfg.get("qf_late_max", ab_cfg.get("delta_late_max", 0.10)))
-
-            data_next, decisions, qf_deltas, qf_route_full, qf_b2d_full, qf_eval_preplan = quick_filter_relocations(
-                data_cur=data_cur,
-                data_prelim=data_prelim,
-                full_route_cur=full_route_cur,
-                full_b2d_cur=full_b2d_cur,
-                prefix_route=prefix_route,
-                req_clients=req_clients,
-                decisions=decisions_raw,
-                alpha_drone=0.3,
-                lambda_late=50.0,
-                truck_speed=sim.TRUCK_SPEED_UNITS,
-                drone_speed=sim.DRONE_SPEED_UNITS,
-                delta_cost_max=qf_cost_max,
-                delta_late_max=qf_late_max,
-            )
-    else:
-        # G0：data_next/decisions 已在上方构造
+    if len(req_clients) == 0:
+        # 无新请求，直接沿用
+        data_next = data_cur
+        decisions = []
+        qf_deltas = {}
         qf_route_full, qf_b2d_full, qf_eval_preplan = None, None, None
+    else:
+        # 中文注释：从 ab_cfg 读取 quick_filter 关键参数；未配置则使用默认值。
+        qf_cost_max = float(ab_cfg.get("qf_cost_max", ab_cfg.get("delta_cost_max", 30.0)))
+        qf_late_max = float(ab_cfg.get("qf_late_max", ab_cfg.get("delta_late_max", 0.10)))
+
+        data_next, decisions, qf_deltas, qf_route_full, qf_b2d_full, qf_eval_preplan = quick_filter_relocations(
+            data_cur=data_cur,
+            data_prelim=data_prelim,
+            full_route_cur=full_route_cur,
+            full_b2d_cur=full_b2d_cur,
+            prefix_route=prefix_route,
+            req_clients=req_clients,
+            decisions=decisions_raw,
+            alpha_drone=0.3,
+            lambda_late=50.0,
+            truck_speed=sim.TRUCK_SPEED_UNITS,
+            drone_speed=sim.DRONE_SPEED_UNITS,
+            delta_cost_max=qf_cost_max,
+            delta_late_max=qf_late_max,
+            )
 
     # 6. 记录 Decision Log
     for (cid, dec, nx, ny, reason) in decisions:
@@ -1488,120 +1438,6 @@ def run_decision_epoch(
     num_req = len(decisions)
     num_acc = sum(1 for d in decisions if str(d[1]).startswith("ACCEPT"))
     num_rej = sum(1 for d in decisions if str(d[1]).startswith("REJECT"))
-
-    # ====== G0 / G1：不进入 ALNS（对照组）======
-    if method == "G0":
-        # 沿用旧解评估（route/b2d/坐标均不更新）
-        full_eval_g0 = sim.evaluate_full_system(
-            data_next, full_route_cur, full_b2d_cur,
-            alpha_drone=0.3, lambda_late=50.0,
-            truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
-        )
-        solver_time = time.time() - t_start_total
-        stat_record = ut._pack_scene_record(
-            scene_idx, decision_time, full_eval_g0,
-            num_req=num_req, num_acc=num_acc, num_rej=num_rej,
-            alpha_drone=0.3, lambda_late=50.0, solver_time=solver_time
-        )
-        return {
-            'break': False,
-            'skip': True,
-            'data_next': data_next,
-            'full_route_next': full_route_cur,
-            'full_b2d_next': full_b2d_cur,
-            'full_arrival_next': full_arrival_cur,
-            'full_depart_next': full_depart_cur,
-            'full_finish_next': full_finish_cur,
-            'stat_record': stat_record,
-            'decision_log_rows': decision_log_rows,
-            'full_eval': full_eval_g0,
-            'viz_pack': {
-                'data': data_next,
-                'route': full_route_cur,
-                'b2d': full_b2d_cur,
-                'decisions': decisions,
-                'virtual_pos': virtual_pos,
-                'prefix_route': prefix_route
-            }
-        }
-
-    if method == "G1":
-        # 只使用 quick_filter 的局部修补结果（若无请求则沿用旧解），不跑 ALNS
-        full_route_next = list(qf_route_full) if (qf_route_full is not None) else list(full_route_cur)
-        full_b2d_next = {b: list(cs) for b, cs in qf_b2d_full.items()} if (qf_b2d_full is not None) else {b: cs.copy() for b, cs in full_b2d_cur.items()}
-
-        # 兜底: 未覆盖客户强制插入卡车
-        full_route_next = sim.cover_uncovered_by_truck_suffix(
-            data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), unserved_customers=unserved_all, verbose=verbose
-        )
-
-        # 全系统排程 + 评估
-        full_arrival_next, full_total_time_next, _ = sim.compute_truck_schedule(
-            data_next, full_route_next, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
-        )
-        full_depart_next, full_finish_next, _ = sim.compute_multi_drone_schedule(
-            data_next, full_b2d_next, full_arrival_next,
-            num_drones_per_base=sim.NUM_DRONES_PER_BASE, drone_speed=sim.DRONE_SPEED_UNITS
-        )
-        full_finish_all_next = dict(full_arrival_next)
-        for _cid, _fin in full_finish_next.items():
-            if str(data_next.nodes[int(_cid)].get("node_type")).lower() == "customer":
-                full_finish_all_next[int(_cid)] = float(_fin)
-
-        full_eval_g1 = sim.evaluate_full_system(
-            data_next, full_route_next, full_b2d_next,
-            alpha_drone=0.3, lambda_late=50.0,
-            truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
-        )
-        solver_time = time.time() - t_start_total
-        # 【修改2】新增：为 Greedy 单独生成一个单行收敛文件（用于画水平基准线）
-        if bool(ab_cfg.get("trace_converge", False)):
-            trace_dir = str(ab_cfg.get("trace_dir", "outputs"))
-            os.makedirs(trace_dir, exist_ok=True)
-            g1_csv = os.path.join(trace_dir, f"converge_Greedy_seed{seed}_scene{scene_idx}.csv")
-            with open(g1_csv, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=["iter", "best_cost_dist", "best_total_late", "best_truck_dist",
-                                                  "best_drone_dist"])
-                w.writeheader()
-                # 只有第 0 代（初始/最终状态）
-                w.writerow({
-                    "iter": 0,
-                    "best_cost_dist": float(
-                        full_eval_g1.get("truck_dist_eff", full_eval_g1["truck_dist"])) + 0.3 * float(
-                        full_eval_g1["drone_dist"]),
-                    "best_total_late": float(full_eval_g1["total_late"]),
-                    "best_truck_dist": float(full_eval_g1["truck_dist"]),
-                    "best_drone_dist": float(full_eval_g1["drone_dist"]),
-                })
-        if verbose:
-            print(f"    [RUNTIME] {method} QuickFilter+Repair: {solver_time:.3f} s")
-        stat_record = ut._pack_scene_record(
-            scene_idx, decision_time, full_eval_g1,
-            num_req=num_req, num_acc=num_acc, num_rej=num_rej,
-            alpha_drone=0.3, lambda_late=50.0, solver_time=solver_time
-        )
-        return {
-            'break': False,
-            'skip': True,
-            'data_next': data_next,
-            'full_route_next': full_route_next,
-            'full_b2d_next': full_b2d_next,
-            'full_arrival_next': full_arrival_next,
-            'full_depart_next': full_depart_next,
-            'full_finish_next': full_finish_all_next,
-            'stat_record': stat_record,
-            'decision_log_rows': decision_log_rows,
-            'full_eval': full_eval_g1,
-            'viz_pack': {
-                'data': data_next,
-                'route': full_route_next,
-                'b2d': full_b2d_next,
-                'decisions': decisions,
-                'virtual_pos': virtual_pos,
-                'prefix_route': prefix_route
-            }
-        }
-
 
     # 强制跳过重规划的条件：无ACCEPT 且 无force_truck变更
     if (num_acc == 0) and (len(forced_truck) == 0) and (len(req_clients) == 0):
@@ -1805,21 +1641,7 @@ def run_decision_epoch(
         "arrival_prefix": arrival_prefix, "init_route": init_route,
         "dbg_postcheck": bool(ab_cfg.get("dbg_postcheck", False)),
     })
-    # ===================== 收敛曲线开关/路径 =====================
-    trace_on = bool(ab_cfg.get("trace_converge", False))
 
-    # 【修改1】放开限制：只要开启了 trace_on，所有进入 ALNS 的算法（包括 TruckOnly）都要记录
-    if trace_on:
-        trace_dir = str(ab_cfg.get("trace_dir", "outputs"))
-        try:
-            os.makedirs(trace_dir, exist_ok=True)
-        except Exception:
-            pass
-        ctx_for_alns["trace_converge"] = True
-        ctx_for_alns["trace_csv_path"] = os.path.join(trace_dir, f"converge_{method}_seed{seed}_scene{scene_idx}.csv")
-    else:
-        ctx_for_alns["trace_converge"] = False
-        ctx_for_alns["trace_csv_path"] = None
     t_solve_start = time.time()
     solver_val = 0.0
     if planner in ("GRB", "GUROBI"):
@@ -1953,6 +1775,35 @@ def run_decision_epoch(
             if int(ab_cfg.get("grb_verbose", 0)) >= 1:
                 print(
                     f"[GRB] milp_obj_km={grb_obj_km:.3f} | suffix_cost_units={alns_suffix_cost:.3f} | late_h={alns_suffix_late:.3f}")
+    elif planner in ("GREEDY", "G1"):
+        # -----------------------
+        # Greedy / Preplan 基线：不做任何迭代优化
+        # 直接采用 preplan 后缀(init_route) + 继承的无人机分配(base_to_drone_next)
+        # -----------------------
+        route_next = list(init_route) if init_route is not None else [start_idx_for_alns, data_next.central_idx]
+        b2d_next = {b: list(cs) for b, cs in (base_to_drone_next or {}).items()}
+
+        # 复用上面已算好的 pre_suffix_*（若不存在则补算一次，避免后面 post-check/记录出现 None）
+        if pre_suffix_cost is None or pre_suffix_late is None:
+            (_c, _, _, _, _, _late, _) = sim.evaluate_truck_drone_with_time(
+                data_next,
+                list(route_next),
+                {b: list(cs) for b, cs in (b2d_next or {}).items()},
+                start_time=decision_time,
+                arrival_prefix=arrival_prefix,
+                alpha_drone=alpha,
+                lambda_late=lam,
+                truck_speed=sim.TRUCK_SPEED_UNITS,
+                drone_speed=sim.DRONE_SPEED_UNITS
+            )
+            alns_suffix_cost = float(_c)
+            alns_suffix_late = float(_late)
+        else:
+            alns_suffix_cost = float(pre_suffix_cost)
+            alns_suffix_late = float(pre_suffix_late)
+
+        solver_val = time.time() - t_solve_start
+
     elif planner == "GA":
         # -----------------------
         # [新增] 走 GA（遗传算法）分支
@@ -1974,7 +1825,7 @@ def run_decision_epoch(
         (route_next, b2d_next, alns_suffix_cost, _, _, alns_suffix_late, _) = alns_truck_drone(
             data_next, base_to_drone_next, max_iter=1000,
             remove_fraction=remove_fraction_cfg, T_start=sa_T_start, T_end=sa_T_end, alpha_drone=0.3, lambda_late=50.0,
-            truck_customers=truck_next, use_rl=False,
+            truck_customers=truck_next, use_rl=ab_cfg.get("use_rl", False),
             start_idx=start_idx_for_alns, start_time=decision_time, bases_to_visit=bases_to_visit,
             ctx=ctx_for_alns
         )
@@ -2079,27 +1930,7 @@ def run_decision_epoch(
         alpha_drone=0.3, lambda_late=50.0,
         truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
     )
-    # ================= [新增诊断打印] =================
-    if verbose and (qf_eval_preplan is not None):
-        # 获取 ALNS/GA 跑完后的成本
-        cost_solver = float(full_eval.get("cost", 0.0))
-        # 获取 Greedy (Preplan) 的原始成本
-        cost_greedy = float(qf_eval_preplan.get("cost", qf_eval_preplan.get("cost(obj)", 0.0)))
 
-        diff = cost_solver - cost_greedy
-
-        # (Fix User Request #5) 动态显示 Planner 名称
-        planner_name = str(ab_cfg.get("planner", "ALNS")).upper()
-        if method == "GA": planner_name = "GA"  # 优先用 method 字段区分
-
-        print(f"    [COMPARE-INTERNAL] {planner_name}={cost_solver:.4f} vs Greedy={cost_greedy:.4f} | Diff={diff:.4f}")
-
-        if abs(diff) < 1e-6:
-            print(f"    [ANALYSIS] {planner_name} 完全没有改动初始解")
-        elif diff > 0:
-            print("    [ANALYSIS] ALNS 跑输了！结果比贪婪还差（稍后可能会触发回滚）")
-        else:
-            print("    [ANALYSIS] ALNS 赢了！找到了更优解")
     # ================================================
     # [FIX] TruckOnly 模式下，禁止回滚到 QuickFilter 生成的（可能含无人机的）预案
     if bool(ab_cfg.get("force_truck_mode", False)):

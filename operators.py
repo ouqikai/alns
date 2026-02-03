@@ -6,14 +6,6 @@ import simulation as sim
 # 工具函数：保护节点 / 可复现采样 / 统一读取 ctx 里的集合
 # =========================================================
 
-_WARN_ONCE = set()
-
-def _warn_once(tag: str, msg: str):
-    if tag in _WARN_ONCE:
-        return
-    _WARN_ONCE.add(tag)
-    print(msg)
-
 def _get_protected_nodes(ctx, data):
     """统一构造 protected_nodes。默认额外保护所有 base 节点，避免 destroy 误删基站。"""
     protected = set(ctx.get("protected_nodes", set()))

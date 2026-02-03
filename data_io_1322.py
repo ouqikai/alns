@@ -1,4 +1,3 @@
-
 # data_io_1529.py
 # 说明：
 # - 仅负责“数据读入 + 基础一致性校验 + 生成 costMatrix + 最近基站(base_id)”
@@ -246,12 +245,5 @@ def read_data(
                     if dist_round <= float(uav_endurance):
                         data.UAVCustomerinDCRange.append(cidx)
                         break
-
-    # 你如果不想要这个打印，直接删掉即可
-    coord_stats = {}
-    for node in data.nodes:
-        if node["node_type"] == "customer":
-            coord_stats[node.get("coord_source", "UNKNOWN")] = coord_stats.get(node.get("coord_source", "UNKNOWN"), 0) + 1
-    # print(f"场景{scenario}坐标使用统计: {coord_stats}")
 
     return data
