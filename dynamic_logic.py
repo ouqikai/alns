@@ -1258,7 +1258,16 @@ def run_decision_epoch(
     served_all = truck_served | drone_served_set
     all_customers = {i for i, n in enumerate(data_cur.nodes) if n.get('node_type') == 'customer'}
     unserved_all = all_customers - served_all
-
+    # ====================================================================
+    # [🚨 核心 Bug 修复：驱除历史幽灵！]
+    # 如果一个客户在真实物理世界中已经服务完毕，必须清空它的强制约束标记。
+    # 否则 ALNS 会在未来的后缀规划中，为了去覆盖一个“历史节点”而导致 100% 报错和疯狂绕路！
+    # ====================================================================
+    for c in served_all:
+        if 0 <= c < len(data_cur.nodes):
+            data_cur.nodes[c]["force_truck"] = 0
+            data_cur.nodes[c]["base_lock"] = None
+    # ====================================================================
     # 2. 识别基站状态
     all_bases = [i for i, n in enumerate(data_cur.nodes) if n.get('node_type') == 'base']
     if data_cur.central_idx not in all_bases:
@@ -1818,6 +1827,17 @@ def run_decision_epoch(
             ctx=ctx_for_alns
         )
         solver_val = time.time() - t_solve_start
+    elif planner == "VNS":
+        import vns_solver
+        (route_next, b2d_next, alns_suffix_cost, _, _, alns_suffix_late, _) = vns_solver.vns_truck_drone(
+            data_next, base_to_drone_next,
+            max_iter=int(ab_cfg.get('alns_max_iter', 1000)),
+            alpha_drone=0.3, lambda_late=50.0,
+            truck_customers=truck_next,
+            start_idx=start_idx_for_alns, start_time=decision_time, bases_to_visit=bases_to_visit,
+            ctx=ctx_for_alns
+        )
+        solver_val = time.time() - t_solve_start
     else:
         # -----------------------
         # 走 ALNS（你原代码不动）
@@ -1940,6 +1960,10 @@ def run_decision_epoch(
         qf_eval_preplan = None
         qf_route_full = None
         qf_b2d_full = None
+    # ======= 新增：强行关闭 GUROBI 的回滚护栏 =======
+    planner_tag = str(ab_cfg.get("planner", "ALNS")).upper()
+    if planner_tag in ("GRB", "GUROBI"):
+        qf_eval_preplan = None
     if (qf_eval_preplan is not None) and (qf_route_full is not None) and (qf_b2d_full is not None):
         eps = float(ab_cfg.get("postcheck_eps", 1e-6))
         # 注意：下面字段名按你 evaluate_full_system 的实际 key 来改（你现在汇总表里有 cost(obj)、total_late）

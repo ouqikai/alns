@@ -93,7 +93,7 @@ CFG_D = {
     "qf_late_max": 0.5,   # 决策阶段：接受请求的Δlate上限（小时）
 
     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
-    "sa_T_start": 50.0,    # SA 初温（要和Δcost量级匹配）
+    "sa_T_start": 100.0,    # SA 初温（要和Δcost量级匹配）
     "sa_T_end": 1.0,       # SA 末温（后期更贪心）
     "alns_max_iter": 1000,   # 最大跑 1000 代
     "max_no_improve": 1000,   # [新增] 连续 150 代不动就停
@@ -114,8 +114,8 @@ CFG_GA = {
     "name": "Baseline_GA",     # <--- [补齐] 适配 CSV 输出的 name 字段
     "method": "GA",
     "planner": "GA",
-    "ga_max_iter": 150,
-    "max_no_improve": 30,
+    "ga_max_iter": 200,
+    "max_no_improve": 200,
     "ga_pop_size": 50,
     "crossover_rate": 0.8,     # <--- [补齐] 显式记录默认值
     "mutation_rate": 0.2,      # <--- [补齐] 显式记录默认值
@@ -262,20 +262,20 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         ctx0["trace_csv_path"] = None
     # =========================================================================================
 
-    # 【默认值】：对所有算法（Greedy, TruckOnly, 以及未来你加的任何对比算法），默认不惩罚
-    lambda_scene0 = 0.0
+    # ================= [Scene 0: 统一共享高质量起点] =================
+    # 为了严谨地对比各算法的“动态重规划能力”（控制变量法），
+    # 强制所有算法在 t=0 共享由 ALNS 生成的高质量初始方案。
 
-    # 【特权判断】：只对“完全体 ALNS”施加约束
-    if is_promise_file and (method_name == "G3") and (not is_truck_only):
-        lambda_scene0 = 50.0
-        if verbose:
-            print("    [Scene 0] PROPOSED ALNS (Main): Enforcing promise windows (lambda=50).")
+    # 关键修复：既然是 promise 文件，所有算法在获取 t=0 起点时，都必须遵守时间窗（lambda=50）
+    if is_promise_file:
+        lambda_scene0 = float(ab_cfg.get("lambda_late", 50.0))
+        if verbose: print(f"    [Scene 0] Enforcing promise windows (lambda={lambda_scene0}) for shared baseline.")
     else:
-        if verbose:
-            print(
-                f"    [Scene 0] Baseline/Other ({method_name}, TruckOnly={is_truck_only}): Ignoring promise (lambda=0).")
-    # -----------------------------------------------------------
+        lambda_scene0 = 0.0
+
     t0_start = time.time()
+
+    # 无论 ab_cfg["planner"] 是谁，t=0 统一调用 ALNS 获取优质基准
     (best_route,
      best_b2d,
      best_cost,
@@ -287,65 +287,47 @@ def run_one(file_path: str, seed: int, ab_cfg: dict, perturbation_times=None, en
         base_to_drone_customers,
         max_iter=int(ab_cfg.get('alns_max_iter', 1000)),
         remove_fraction=float(ab_cfg.get("remove_fraction", 0.10)),
-        T_start=float(ab_cfg.get("sa_T_start", ab_cfg.get("T_start", 50.0))),
-        T_end=float(ab_cfg.get("sa_T_end", ab_cfg.get("T_end", 1.0))),
+        T_start=float(ab_cfg.get("sa_T_start", 50.0)),
+        T_end=float(ab_cfg.get("sa_T_end", 1.0)),
         alpha_drone=0.3,
         lambda_late=lambda_scene0,
         truck_customers=truck_customers,
         use_rl=False,
-        rl_tau=0.5,
-        rl_eta=0.1,
         bases_to_visit=bases_visit_0,
         ctx=ctx0
     )
     t0_end = time.time()
     scene0_runtime = t0_end - t0_start
     if verbose:
-        print(f"    [SCENE 0] Runtime={scene0_runtime:.3f} s")
-    # ================= [新增补丁：纯卡车路线方向校正] =================
+        print(f"    [SCENE 0] Shared ALNS Baseline generated, Runtime={scene0_runtime:.3f} s")
+
+    # ================= [保留：纯卡车路线方向校正] =================
     # 目的：强制翻转“逆序”路线，防止卡车过早服务大ID客户，导致动态请求失效。
     is_truck_only_mode = bool(ab_cfg.get("force_truck_mode", False))
 
-    # 仅对 TruckOnly 且路线包含至少2个客户时生效
     if is_truck_only_mode and len(best_route) > 3:
-        # 1. 提取中间客户序列（去除首尾 Depot）
-        # best_route 结构通常是 [Depot, C1, C2, ..., Cn, Depot]
         inner_indices = best_route[1:-1]
-
-        # 2. 获取首尾客户的 NODE_ID (通常 ID 越大数据集中时间越晚)
         first_node_id = data.nodes[inner_indices[0]]['node_id']
         last_node_id = data.nodes[inner_indices[-1]]['node_id']
 
-        # 3. 判定：如果是降序 (例如 100 -> ... -> 1)，说明跑反了
         if first_node_id > last_node_id:
             if verbose:
-                print(f"[TRUCK-TUNE] 🚨 检测到路线逆序 (ID {first_node_id} -> ... -> {last_node_id})。")
-                print(f"[TRUCK-TUNE] 正在翻转路线以匹配事件流，改善请求有效性...")
+                print(f"[TRUCK-TUNE] 🚨 检测到路线逆序 (ID {first_node_id} -> ... -> {last_node_id})。正在翻转...")
 
-            # 4. 执行翻转
-            # 保持首尾 Depot 不动，中间倒序
             best_route = [best_route[0]] + inner_indices[::-1] + [best_route[-1]]
 
-            # 5. !!! 极其重要：翻转后必须强制重算所有状态 !!!
-            # 否则后续动态逻辑会沿用旧的到达时间表，导致逻辑错乱
-
-            # 重新跑一遍系统评估，获取最新状态
-            # 注意：这里的 lambda_late 建议用 50.0 以便看清翻转后的真实代价
             _eval_fixed = sim.evaluate_full_system(
                 data, best_route, best_b2d,
                 alpha_drone=0.3, lambda_late=50.0,
                 truck_speed=sim.TRUCK_SPEED_UNITS, drone_speed=sim.DRONE_SPEED_UNITS
             )
-
-            # 更新关键变量，供后续动态循环使用
             best_cost = _eval_fixed['cost']
             best_truck_dist = _eval_fixed['truck_dist']
             best_total_late = _eval_fixed['total_late']
-
-            # 这里的 arrival_times 会在下面几行代码被再次计算，
-            # 但为了保险起见，这里先更新 best_route 对应的状态。
             if verbose:
                 print(f"[TRUCK-TUNE] ✅ 翻转完成。新状态: Cost={best_cost:.3f}, Late={best_total_late:.3f}")
+    # ==========================================================
+
     arrival_times, total_time, total_late = sim.compute_truck_schedule(
         data, best_route, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
     )
@@ -667,13 +649,25 @@ def run_compare_suite(
     # -----------------------------------------------
     cfg_ga = dict(cfg_base)
     cfg_ga.update(dict(CFG_GA))  # CFG_GA 里有 planner="GA"
-    # 2. 构造对比列表（用“对外标签”，与 TARGET_METHODS 保持一致）
+    # -----------------------------------------------
+    # VNS: 变邻域搜索基线
+    # -----------------------------------------------
+    cfg_vns = dict(cfg_base)
+    cfg_vns.update({
+        "name": "Baseline_VNS",
+        "method": "VNS",
+        "planner": "VNS",
+        "alns_max_iter": 1000,  # 保持与 ALNS 相同的最大迭代次数
+    })
+
+    # 并在 all_groups 列表中加入它：
     all_groups = [
         ("Proposed", cfg_alns_hybrid),
         ("TruckOnly", cfg_truck),
         ("Greedy", cfg_greedy),
-        ("GA", cfg_ga),  # 注意：用 cfg_ga，不要用 CFG_GA
-        ("Gurobi", cfg_grb),  # 注意：用 cfg_grb，不要用 CFG_GUROBI
+        ("GA", cfg_ga),
+        ("Gurobi", cfg_grb),
+        ("VNS", cfg_vns),  # <--- 新增这行
     ]
 
     if target_methods:
@@ -791,10 +785,10 @@ def main():
     # events_path = r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\events_25_seed2023_20260129_164341.csv"
     # file_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\nodes_50_seed2023_20260129_174717_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\events_50_seed2023_20260129_174717.csv"
-    # file_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\nodes_100_seed2023_20260129_190818_promise.csv"
-    # events_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\events_100_seed2023_20260129_190818.csv"
-    file_path = r"D:\代码\ALNS+DL\nodes_200_seed2023_20260203_142507.csv"
-    events_path = r"D:\代码\ALNS+DL\events_200_seed2023_20260203_142507.csv"
+    file_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\nodes_100_seed2023_20260129_190818_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\events_100_seed2023_20260129_190818.csv"
+    # file_path = r"D:\代码\ALNS+DL\nodes_200_seed2023_20260203_142507.csv"
+    # events_path = r"D:\代码\ALNS+DL\events_200_seed2023_20260203_142507.csv"
     seed = 2025
     cfg = dict(CFG_D)
     cfg.update({"use_rl": False,          # <--- 开启 RL
@@ -830,7 +824,7 @@ def main():
 
     # ===== 3) 运行模式开关 =====
     # 3.4 对照组套件：G0–G3（动态对比）
-    RUN_COMPARE_SUITE = False
+    RUN_COMPARE_SUITE = True
 
     if RUN_COMPARE_SUITE:
         import os, time, csv, copy
@@ -839,14 +833,14 @@ def main():
         SEEDS_TO_RUN = [2021, 2022, 2023, 2024, 2025]
 
         # 选择对比层面：模型(model) 或 算法(algo)
-        SUITE_LEVEL = "model"  # "model" 或 "algo"
+        SUITE_LEVEL = "algo"  # "model" 或 "algo"
 
         if SUITE_LEVEL == "model":
             # 模型层面：纯卡车 vs 混合（主方法）
             TARGET_METHODS = ["TruckOnly", "Proposed"]
         elif SUITE_LEVEL == "algo":
             # 算法层面：固定混合模型，对比多算法
-            TARGET_METHODS = ["Gurobi", "Greedy", "GA", "Proposed"]
+            TARGET_METHODS = ["Gurobi", "Greedy", "GA", "Proposed", "VNS"]
         else:
             TARGET_METHODS = None  # 全跑（一般不建议）
 

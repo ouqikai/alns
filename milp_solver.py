@@ -252,7 +252,14 @@ def solve_milp_return_from_df(
     # ---------- 客户访问：u[c] == z[c] ----------
     for c in customers:
         m.addConstr(u[c] == z[c], name=f"visit_customer_equals_truck_{c}")
+    # ==================== [核心修复：强制访问未路过的基站] ====================
+    if visited_bases_for_drone is None:
+        visited_bases_for_drone = set()
 
+    for b in bases:
+        if b != depot and b not in visited_bases_for_drone:
+            m.addConstr(u[b] == 1, name=f"mandatory_visit_future_base_{b}")
+    # ========================================================================
     # ---------- 每个客户必须被服务 ----------
     y_by_c: Dict[int, List[Tuple[int, int]]] = {c: [] for c in customers}
     for (b, c) in feas_pairs:
