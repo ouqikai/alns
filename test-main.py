@@ -18,7 +18,7 @@
 说明：本文件仍保持可直接运行（main()/main_cli()），便于你现有实验脚本与复现流程不改。
 """
 import os, time, json, csv, copy
-import operators as ops  # 引入算子模块
+import operatorsnew as ops  # 引入算子模块
 import simulation as sim  # 引入仿真模块
 import utils as ut # 工具模块
 import dynamic_logic as dyn  # 动态逻辑
@@ -108,31 +108,7 @@ CFG_D = {
 "disable_postcheck": 0,
 "lambda_prom": 0.0
 }
-# CFG_D = {
-#     "NAME": "D_full_structured",
-#     "PAIRING_MODE": "free",
-#     "late_hard": 1000.0,  # 建议显式写在 cfg 里（要更严就 0.10）
-#     "late_hard_delta": 1.0,
-#     # ===== 新增：quick_filter 阈值（从 cfg 读取，避免写死不一致）=====
-#     "qf_cost_max": 30,   # 决策阶段：接受请求的Δcost上限
-#     "qf_late_max": 0.5,   # 决策阶段：接受请求的Δlate上限（小时）
-#
-#     # ===== 新增：SA 温度尺度（从 cfg 读取）=====
-#     "sa_T_start": 150.0,    # SA 初温（要和Δcost量级匹配）
-#     "sa_T_end": 0.1,       # SA 末温（后期更贪心）
-#     "alns_max_iter": 1000,   # 最大跑 1000 代
-#     "max_no_improve": 1000,   # [新增] 连续 150 代不动就停
-#     # ===== 新增：destroy 强度（从 cfg 读取）=====
-#     "remove_fraction": 0.18,
-#     "min_remove": 5,
-#     "DESTROYS": ["D_random_route", "D_worst_route", "D_reloc_focus_v2", "D_switch_coverage", "D_late_worst"],
-#     "REPAIRS": ["R_greedy_only", "R_regret_only", "R_greedy_then_drone", "R_regret_then_drone",
-#                 "R_late_repair_reinsert", "R_base_feasible_drone_first"],
-#     "dbg_alns": False,
-#     "dbg_postcheck": False,
-# "disable_postcheck": 0,
-# "lambda_prom": 0.0
-# }
+
 CFG_GA = {
     "NAME": "Baseline_GA",
     "name": "Baseline_GA",     # <--- [补齐] 适配 CSV 输出的 name 字段
@@ -807,12 +783,12 @@ def main():
     # ===== 1) 实验输入 =====
     # file_path = r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\nodes_25_seed2023_20260129_164341_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\events_25_seed2023_20260129_164341.csv"
-    file_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\nodes_50_seed2023_20260129_174717_promise.csv"
-    events_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\events_50_seed2023_20260129_174717.csv"
+    # file_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\nodes_50_seed2023_20260129_174717_promise.csv"
+    # events_path = r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\events_50_seed2023_20260129_174717.csv"
     # file_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\nodes_100_seed2023_20260129_190818_promise.csv"
     # events_path = r"D:\代码\ALNS+DL\exp\datasets\100_data\2023\events_100_seed2023_20260129_190818.csv"
-    # file_path = r"D:\代码\ALNS+DL\nodes_200_seed2023_20260203_142507.csv"
-    # events_path = r"D:\代码\ALNS+DL\events_200_seed2023_20260203_142507.csv"
+    file_path = r"D:\代码\ALNS+DL\exp\runs\nodes_200_seed2023_20260309_140841_promise.csv"
+    events_path = r"D:\代码\ALNS+DL\exp\runs\events_200_seed2023_20260309_140841.csv"
     seed = 2023
     cfg = dict(CFG_D)
     cfg.update({"use_rl": False,          # <--- 开启 RL
@@ -848,7 +824,7 @@ def main():
 
     # ===== 3) 运行模式开关 =====
     # 3.4 对照组套件：G0–G3（动态对比）
-    RUN_COMPARE_SUITE = False
+    RUN_COMPARE_SUITE = True
 
     if RUN_COMPARE_SUITE:
         import os, time, csv, copy
@@ -858,13 +834,13 @@ def main():
 
         # 选择对比层面：模型(model) 或 算法(algo)
         SUITE_LEVEL = "algo"  # "model" 或 "algo"
-
         if SUITE_LEVEL == "model":
             # 模型层面：纯卡车 vs 混合（主方法）
             TARGET_METHODS = ["TruckOnly", "Proposed"]
         elif SUITE_LEVEL == "algo":
             # 算法层面：固定混合模型，对比多算法
-            TARGET_METHODS = ["Gurobi", "Greedy", "GA", "Proposed", "VNS"]
+            # TARGET_METHODS = ["Gurobi", "Greedy", "GA", "Proposed", "VNS"]
+            TARGET_METHODS = ["Greedy", "GA", "Proposed", "VNS"]
         else:
             TARGET_METHODS = None  # 全跑（一般不建议）
 
