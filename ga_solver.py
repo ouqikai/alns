@@ -125,36 +125,7 @@ def _decode_and_repair(ind, start_idx, end_idx, data, visited_bases,
         # 执行最佳插入
         if best_pos != -1:
             route.insert(best_pos, b_idx)
-    # =================================================================
-    # [新增：GA 公交车模式强制补齐]
-    # 强制 GA 遵守外层系统的规定，必须访问所有 bases_to_visit
-    # =================================================================
-    if "bases_to_visit" in ctx:
-        required_bases = set(ctx["bases_to_visit"])
-        current_route_set = set(route)
 
-        # 找出 GA 漏掉的空闲基站
-        missing_bases = required_bases - current_route_set
-
-        # 将漏掉的基站以“增加距离最小”的贪心方式强行插回卡车路线上
-        for b in missing_bases:
-            best_pos = 1
-            best_delta = float('inf')
-            for i in range(1, len(route)):
-                prev = route[i - 1]
-                curr = route[i]
-                try:
-                    delta = sim.truck_arc_cost(data, prev, b) + sim.truck_arc_cost(data, b,
-                                                                                   curr) - sim.truck_arc_cost(data,
-                                                                                                              prev,
-                                                                                                              curr)
-                except Exception:
-                    delta = float('inf')
-                if delta < best_delta:
-                    best_delta = delta
-                    best_pos = i
-            route.insert(best_pos, b)
-    # =================================================================
     return route, b2d
 
 def ga_truck_drone(data, base_to_drone_customers, max_iter=200, pop_size=50,

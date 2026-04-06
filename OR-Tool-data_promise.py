@@ -723,8 +723,6 @@ def _predict_tau_ref(
             cust_to_base[int(nid)] = int(best)
 
     # ---- 2) 构造卡车参考路线：访问“有无人机客户的基地 + 圈外客户” ----
-    # [回退版] 使用最近邻 (NN) 策略，逻辑简单鲁棒
-
     # 需要访问的基地（不含 central 本身；central 到达时刻为 0）
     bases_to_visit = sorted({b for b in cust_to_base.values() if b in bases_xy})
     # NN 访问顺序：central -> ... -> central
@@ -750,6 +748,7 @@ def _predict_tau_ref(
         arrive_time[int(nxt)] = cur_t
         cur_x, cur_y = node_xy[nxt]
         unvisited.remove(nxt)
+
     # ---- 3) 无人机并行调度：每个基地 b 从 A_b 时刻开始派送 ----
     tau_ref: Dict[int, float] = {}
 
@@ -968,7 +967,6 @@ def generate_events_csv(
         """
         rem = {c: int(global_want[c]) for c in classes}
         want_by_t: Dict[float, Dict[str, int]] = {}
-
         for t_k in T_list:
             need = int(M_k[t_k])
             if need <= 0:
@@ -1020,103 +1018,35 @@ def generate_events_csv(
 
     stat_desired = {t: {c: int(want_plan[t].get(c, 0)) for c in classes} for t in T_list}
     stat_real = {t: {c: 0 for c in classes} for t in T_list}
-    # ====== [新增] 预计算参考路径的拓扑序列 (Sequence Rank) ======
-    print("[EVENTS] Generating reference topology using OR-Tools (for sequence ranking)...")
 
-    # 1. 准备 OR-Tools 输入：只包含 central + 所有客户 (bases 不参与排序，因为它们是必经点)
-    # Ref: central is index 0
-    ref_nodes_input = [(central[0], central[1])]
-    ref_ids_map = {0: -1}  # OR-Tools index -> Real Node ID (-1 for central)
-
-    current_idx = 1
-    # 加入所有客户（不管圈内圈外，统统排个序）
-    for c in customers:
-        ref_nodes_input.append((float(c["X"]), float(c["Y"])))
-        ref_ids_map[current_idx] = int(c["NODE_ID"])
-        current_idx += 1
-
-    # 调用 OR-Tools (借用现有的 plan_truck_route_ortools_for_tw 函数)
-    # 把所有客户都塞到 truck_clients 参数里，bases 传空
-    ref_route_coords = plan_truck_route_ortools_for_tw(
-        bases=[],
-        central=(central[0], central[1]),
-        truck_clients=[(x, y, 0) for x, y in ref_nodes_input[1:]],  # 跳过central
-        time_limit_s=5,  # 给多一点时间保证质量
-        seed=seed_for_events,
-        use_local_search=True
-    )
-
-    # 2. 将坐标序列转换为 ID 的进度表 (0.0 ~ 1.0)
-    # ref_route_coords 是有序的坐标列表 [(x,y), (x,y)...]
-    node_progress = {}  # {NODE_ID: progress_float}
-    total_steps = len(ref_route_coords)
-
-    # 建立坐标指纹到 ID 的映射（防止浮点误差）
-    def get_coord_key(x, y):
-        return (round(x, 4), round(y, 4))
-
-    coord_to_id = {}
-    for c in customers:
-        coord_to_id[get_coord_key(float(c['X']), float(c['Y']))] = int(c['NODE_ID'])
-
-    for idx, (rx, ry) in enumerate(ref_route_coords):
-        key = get_coord_key(rx, ry)
-        if key in coord_to_id:
-            nid = coord_to_id[key]
-            # 记录该客户在路径中的相对位置 (0.0 = 起点, 1.0 = 终点)
-            if nid not in node_progress:
-                node_progress[nid] = idx / max(1, total_steps - 1)
-
-    print(f"[EVENTS] Sequence ranking built for {len(node_progress)} customers.")
-    # =================================================================
     for t_k in T_list:
 
         need = int(M_k[t_k])
         if need <= 0:
             continue
-        # ====== [修改] 基于序列进度的候选筛选 ======
 
-        # 1. 计算当前时间进度 (0.0 ~ 1.0)
-        # 假设 decision_times 是有序的，用最后一个时间作为结束基准
-        # max_t 用于归一化：比如当前是第 4 小时，总共 8 小时，进度就是 0.5
-        max_t = float(T_list[-1])
-        time_progress = float(t_k) / max_t
+        # 候选护栏：尽量挑选“更晚才会完成服务”的客户，降低 EXPIRED（事件发生前已服务完）的概率。
+        # 规则：
+        #   1) 优先：τ_i^ref >= t_k + delta_look_h 且未被扰动过
+        #   2) 若不足：放宽到 τ_i^ref >= t_k（仍避免挑选“预测已在决策点前完成”的客户）
+        #   3) 若仍不足：才退化为“任意未用客户”（会打印警告）
+        cand = [c for c in customers
+                if c["NODE_ID"] not in used
+                and float(tau_ref.get(c["NODE_ID"], 1e9)) >= float(t_k) + float(delta_look_h)]
 
-        # 2. 确定允许的进度窗口
-        # 核心逻辑：如果在 50% 的时间点发请求，那么该客户在路径中的位置最好 > 50%
-        # 引入一个安全缓冲 (buffer)，比如 0.05 (5%)
-        # 含义：t=4(50%)时，只选排名在 55% 之后的客户
-        min_seq_progress = time_progress + 0.05
-
-        # 3. 筛选候选人
-        cand = []
-        for c in customers:
-            nid = int(c["NODE_ID"])
-            if nid in used:
-                continue
-
-            # 获取该客户在参考路径中的位置 (如果在 map 里没找到，默认给 1.0 视为最晚)
-            seq_pos = node_progress.get(nid, 1.0)
-
-            # 判据：客户排在当前时间点之后，说明“还没被访问”
-            if seq_pos >= min_seq_progress:
-                cand.append(c)
-
-        # 兜底 A：如果选不出人（比如到了最后时刻），尝试稍微放宽
         if len(cand) < need:
-            # 放宽：只要求排在后 20% 的人（不管当前几点了，只要是最后那批就行）
             cand = [c for c in customers
-                    if int(c["NODE_ID"]) not in used
-                    and node_progress.get(int(c["NODE_ID"]), 0) > 0.8]
-
-        # 兜底 B：还不行就全量
+                    if c["NODE_ID"] not in used
+                    and float(tau_ref.get(c["NODE_ID"], 1e9)) >= float(t_k)]
         if len(cand) < need:
-            cand = [c for c in customers if int(c["NODE_ID"]) not in used]
-            print(f"[WARN] t={t_k}: Sequence buffer exhausted, using fallback.")
+            cand = [c for c in customers if c["NODE_ID"] not in used]
+            print(f"[EVENTS-WARN] t={t_k}: 候选不足，退化为任意未用客户抽样（可能产生 EXPIRED）。")
 
-        # 打乱顺序，避免每次都选同一个，保证随机性
+        # 为保证可复现：先固定顺序再打乱；随后按 τ_ref 从大到小排序，
+        # 使得优先选择“预测更晚服务”的客户（tie 由 shuffle 打破）。
+        cand = sorted(cand, key=lambda x: int(x["NODE_ID"]))
         rng.shuffle(cand)
-        # ============================================
+        cand.sort(key=lambda x: (-float(tau_ref.get(x["NODE_ID"], 1e9)), int(x["NODE_ID"])))
 
         # ——关键：先按比例确定“本决策点各类事件数量”，再从可行客户池中抽取——
         want = stat_desired[t_k]
@@ -1287,78 +1217,44 @@ def generate_nodes_and_events(
 
 if __name__ == "__main__":
     # # 默认：生成 25 客户、5 个 seed 的离线 nodes.csv + events.csv
-    # seed_list = [2021, 2022, 2023, 2024, 2025]
-    # scales = [25, 50, 100, 200]
+    # seed_list = [2023]
+    # # seed_list = [2021, 2022, 2023, 2024, 2025]
+    # n_customers = 100
     #
-    # # 事件参数（全局统一控制变量）
+    # # 事件参数（按论文实验统一）
     # rho_rel = 0.2
     # n_per_dec = 25
-    # decision_times = [1, 2, 3, 4, 5, 6, 7, 8]
-    #
-    # delta_look_h = 6
-    # class_probs = {"IN_DB": 0.6, "CROSS_DB": 0.2, "OUT_DB": 0.2}
+    # # 手动指定决策点（小时），可不等间隔；例如 [1, 2] 或 [0.5, 1.5, 3]
+    # # decision_times = [1, 2]
+    # # decision_times = [1, 2, 3]
+    # decision_times = [1, 2, 3, 4, 5, 6]
+    # # decision_times = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    # # 注意：如果 decision_times 非空，则生成 events 时将忽略 n_per_dec 推导 K
+    # delta_look_h = 0.25
+    # class_probs = {"IN_DB": 0.5, "CROSS_DB": 0.3, "OUT_DB": 0.2}
     # include_central_as_base = True
-    # # 统一输出主目录
-    # base_dir = "datasets"
-    # os.makedirs(base_dir, exist_ok=True)
     #
-    # print(f"🚀 开始批量生成动态协同配送基准数据集...")
-    # for n_customers in scales:
-    #     scale_dir = os.path.join(base_dir, f"{n_customers}_data")
-    #     os.makedirs(scale_dir, exist_ok=True)
-    #     # 严格对齐实验表格中的物理环境设置：n - drone_range - db - scale
-    #     if n_customers == 25:
-    #         v_range = 100.0
-    #         db_cnt = 3
-    #     elif n_customers == 50:
-    #         v_range = 100.0
-    #         db_cnt = 6
-    #     elif n_customers == 100:
-    #         v_range = 150.0
-    #         db_cnt = 8
-    #     elif n_customers == 200:
-    #         v_range = 200.0
-    #         db_cnt = 12
-    #     else:
-    #         v_range = 100.0
-    #         db_cnt = max(1, int(n_customers * 0.12))
-    #
-    #     for s in seed_list:
-    #         seed_dir = os.path.join(scale_dir, str(s))
-    #         os.makedirs(seed_dir, exist_ok=True)
-    #
-    #         # 配置生成器
-    #         cfg = GenConfig(
-    #             n_customers=n_customers,
-    #             visual_range=v_range,
-    #             drone_roundtrip_km=10.0,
-    #             truck_road_factor=1.5,
-    #             seed=int(s),
-    #             base_count_override={n_customers: db_cnt},
-    #         )
-    #
-    #         # 规范化文件命名，去掉时间戳，便于 test-main.py 自动寻址
-    #         out_nodes = os.path.join(seed_dir, f"nodes_{n_customers}_seed{s}.csv")
-    #         out_events = os.path.join(seed_dir, f"events_{n_customers}_seed{s}.csv")
-    #
-    #         print(f"\n[GENERATING] 规模: N={n_customers} | 地图: {v_range}x{v_range} | 基站: {db_cnt} | 种子: {s}")
-    #
-    #         generate_nodes_and_events(
-    #             cfg, out_nodes, out_events,
-    #             rho_rel=rho_rel,
-    #             n_per_dec=n_per_dec,
-    #             decision_times=decision_times,
-    #             delta_look_h=delta_look_h,
-    #             class_probs=class_probs,
-    #             include_central_as_base=include_central_as_base,
-    #         )
-    #
-    # print("\n🎉 全量基准数据集生成完毕！请在 datasets/ 目录下查看。")
-    # =======================================================
-    # 实验一：扰动强度敏感性分析 (Sensitivity Analysis) 数据生成
-    # 核心原则：控制规模和种子不变，仅改变扰动比例 rho_rel
-    # =======================================================
-
+    # for s in seed_list:
+    #     cfg = GenConfig(
+    #         n_customers=n_customers,visual_range=150.0,
+    #         drone_roundtrip_km=10.0,
+    #         truck_road_factor=1.5,
+    #         seed=int(s), base_count_override={25: 3,
+    #             50: 6,
+    #             100: 8, 200: 12},
+    #     )
+    #     now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    #     out_nodes = f"nodes_{cfg.n_customers}_seed{cfg.seed}_{now}.csv"
+    #     out_events = f"events_{cfg.n_customers}_seed{cfg.seed}_{now}.csv"
+    #     generate_nodes_and_events(
+    #         cfg, out_nodes, out_events,
+    #         rho_rel=rho_rel,
+    #         n_per_dec=n_per_dec,
+    #         decision_times=decision_times,
+    #         delta_look_h=delta_look_h,
+    #         class_probs=class_probs,
+    #         include_central_as_base=include_central_as_base,
+    #     )
     # 控制变量：固定规模 100，固定种子 2023
     fixed_scale = 100
     seed_list = [2023]

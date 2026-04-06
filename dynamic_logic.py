@@ -7,7 +7,7 @@ import simulation as sim
 import numpy as np
 import utils as ut # apply函数依赖这个
 from data_io_1322 import recompute_cost_and_nearest_base # 依赖这个重算距离
-import operators as ops
+import operatorsnew as ops
 import pandas as pd
 import milp_solver as grb   # 你把 01162113.py 复制改名后的模块
 import time
@@ -870,6 +870,8 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
     )
     protected_nodes = set(ctx["bases_to_visit"]) | {start_idx_used, data.central_idx} | forced_customers
     init_route = ctx.get("init_route", None)
+    # 2) 当前/最优的 base_to_drone 也要拷贝
+    current_b2d = {b: lst[:] for b, lst in base_to_drone_customers.items()}
     if init_route is not None and isinstance(init_route, (list, tuple)) and len(init_route) >= 2:
         # 中文注释：warm-start，用 quick_filter 的预定解作为 ALNS 初始解，避免“决策可行但 ALNS 重排后失控”
         current_route = list(init_route)
@@ -879,9 +881,8 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
             data, truck_customers, start_idx=start_idx_used, end_idx=data.central_idx,
             bases_to_visit=ctx["bases_to_visit"]
         )
-
-    # 2) 当前/最优的 base_to_drone 也要拷贝
-    current_b2d = {b: lst[:] for b, lst in base_to_drone_customers.items()}
+        # 【新增】：一上来就把没有任务的基站踢掉
+        current_route = ops.sync_route_bases(data, current_route, current_b2d, ctx)
 
     (current_cost,
     current_truck_dist,
@@ -951,40 +952,19 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
     max_no_improve = int(ctx.get("max_no_improve", 200))  # 默认 200 代无改进就停止
     no_improve_cnt = 0
 
-    # ================= [State-Aware RL INIT] =================
-    # 初始化：区分 Normal (0) 和 Critical (1) 两种状态
-    # 状态定义：0 = 无迟到(Late <= 1e-3); 1 = 有迟到(Late > 1e-3)
+    # ================= [标准 ALNS 初始化] =================
     INITIAL_WEIGHT = 10.0
+    curr_d_w = {op.__name__: INITIAL_WEIGHT for op in DESTROYS}
+    curr_r_w = {op.__name__: INITIAL_WEIGHT for op in REPAIRS}
 
-    # 结构：weights[state_id][op_name]
-    # 这里演示非 Paired 模式（最常用）
-    d_weights_pool = {
-        0: {op.__name__: INITIAL_WEIGHT for op in DESTROYS},  # Normal
-        1: {op.__name__: INITIAL_WEIGHT for op in DESTROYS}  # Critical
-    }
-    r_weights_pool = {
-        0: {op.__name__: INITIAL_WEIGHT for op in REPAIRS},
-        1: {op.__name__: INITIAL_WEIGHT for op in REPAIRS}
-    }
-    # 可选：人工注入先验知识（Bias）
-    # 在 Critical 状态下，给“迟到修复”算子更高的初始权重，迫使算法优先消迟到
-    if "R_late_repair_reinsert" in r_weights_pool[1]:
-        r_weights_pool[1]["R_late_repair_reinsert"] = 50.0  # 强力推荐
-    if "R_greedy_only" in r_weights_pool[1]:
-        r_weights_pool[1]["R_greedy_only"] = 20.0  # 迟到时纯卡车贪婪插入也比较稳健
-
-    # Paired 模式支持（以防配置切换）
-    pair_weights_pool = {}
+    curr_pair_w = {}
     if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
-        pair_weights_pool = {
-            0: {i: INITIAL_WEIGHT for i in range(len(ALLOWED_PAIRS))},
-            1: {i: INITIAL_WEIGHT for i in range(len(ALLOWED_PAIRS))}
-        }
+        curr_pair_w = {i: INITIAL_WEIGHT for i in range(len(ALLOWED_PAIRS))}
 
-    # 定义得分参数 (Sigma)
+    # 定义标准 ALNS 得分参数
     SIGMA_1 = 20.0  # 全局更优
     SIGMA_2 = 10.0  # 局部更优（被接受）
-    SIGMA_3 = 0.0  # 变差但被接受
+    SIGMA_3 = 2.0  # 变差但被接受 (给一点点辛苦分)
     SIGMA_4 = 0.0  # 被拒绝
     op_stat = {}
     for it in range(1, max_iter + 1):
@@ -996,42 +976,22 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
         old_current_late = current_total_late
         old_best_cost = best_cost
 
-        # 1. 感知当前状态 (State Perception)
-        # 如果总迟到 > 0.001，认为处于 Critical 状态，否则 Normal
-        current_state_id = 1 if current_total_late > 1e-3 else 0
-
-        # 2. 根据状态获取对应的权重表
-        curr_d_w = d_weights_pool[current_state_id]
-        curr_r_w = r_weights_pool[current_state_id]
-        curr_pair_w = pair_weights_pool.get(current_state_id, {})
-
-        # === [RL-SELECT] 自适应选择算子 ===
+        # === [ALNS-SELECT] 标准轮盘赌自适应选择 ===
         selected_pair_idx = -1
 
-        if use_rl:
-            if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
-                # 轮盘赌选择 Pair (基于当前状态权重)
-                total_w = sum(curr_pair_w.values())
-                probs = [curr_pair_w[i] / total_w for i in range(len(ALLOWED_PAIRS))]
-                selected_pair_idx = np.random.choice(len(ALLOWED_PAIRS), p=probs)
-                D, R = ALLOWED_PAIRS[selected_pair_idx]
-            else:
-                # 分别轮盘赌选择 D 和 R (基于当前状态权重)
-                w_d_sum = sum(curr_d_w.values())
-                p_d = [curr_d_w[op.__name__] / w_d_sum for op in DESTROYS]
-                D = np.random.choice(DESTROYS, p=p_d)
-
-                w_r_sum = sum(curr_r_w.values())
-                p_r = [curr_r_w[op.__name__] / w_r_sum for op in REPAIRS]
-                R = np.random.choice(REPAIRS, p=p_r)
+        if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
+            total_w = sum(curr_pair_w.values())
+            probs = [curr_pair_w[i] / total_w for i in range(len(ALLOWED_PAIRS))]
+            selected_pair_idx = np.random.choice(len(ALLOWED_PAIRS), p=probs)
+            D, R = ALLOWED_PAIRS[selected_pair_idx]
         else:
-            # 原有的随机逻辑 (保持不变作为 fallback)
-            if PAIRING_MODE == "paired" and ALLOWED_PAIRS:
-                D, R = random.choice(ALLOWED_PAIRS)
-            else:
-                D = random.choice(DESTROYS)
-                R = random.choice(REPAIRS)
+            w_d_sum = sum(curr_d_w.values())
+            p_d = [curr_d_w[op.__name__] / w_d_sum for op in DESTROYS]
+            D = np.random.choice(DESTROYS, p=p_d)
 
+            w_r_sum = sum(curr_r_w.values())
+            p_r = [curr_r_w[op.__name__] / w_r_sum for op in REPAIRS]
+            R = np.random.choice(REPAIRS, p=p_r)
         dname = getattr(D, "__name__", "D?")
         rname = getattr(R, "__name__", "R?")
         # ===== 统计：每个 (Destroy, Repair) 一份计数器 =====
@@ -1163,48 +1123,43 @@ def alns_truck_drone(data, base_to_drone_customers, max_iter=200, remove_fractio
         else:
             s["sa_reject"] += 1
 
-        # === [RL-UPDATE] 计算得分并更新权重 (State-Aware) ===
-        current_score = SIGMA_4  # 默认拒绝
+            # === [ALNS-UPDATE] 标准计算得分并更新权重 ===
+            current_score = SIGMA_4  # 默认拒绝
 
-        if accept:
-            if cand_cost < old_best_cost - 1e-6:
-                current_score = SIGMA_1  # 全局最优
-            elif cand_cost < old_current_cost - 1e-6:
-                current_score = SIGMA_2  # 局部更优
-            else:
-                current_score = SIGMA_3  # 变差但接受
+            if accept:
+                if cand_cost < old_best_cost - 1e-6:
+                    current_score = SIGMA_1  # 全局最优
+                elif cand_cost < old_current_cost - 1e-6:
+                    current_score = SIGMA_2  # 局部更优
+                else:
+                    current_score = SIGMA_3  # 变差但接受
 
-        # [State-Aware Bonus] 如果处于 Critical 状态且成功降低了迟到，给予额外重奖
-        if accept and (current_state_id == 1) and (cand_total_late < old_current_late - 1e-6):
-            current_score += 15.0
-
-        if use_rl:
+            # 反应因子 (Reaction Factor)，借用 rl_eta 参数
+            reaction_factor = ctx.get("rl_eta", 0.1)
             W_MIN = 0.1
-            # 只更新当前 State 对应的权重表
-            if PAIRING_MODE == "paired" and ALLOWED_PAIRS and selected_pair_idx != -1:
-                # 更新 Pair 权重
-                old_w = curr_pair_w[selected_pair_idx]
-                curr_pair_w[selected_pair_idx] = max(W_MIN, (1 - rl_eta) * old_w + rl_eta * current_score)
-            else:
-                # 分别更新 D 和 R 权重
-                # Update D
-                old_dw = curr_d_w[dname]
-                curr_d_w[dname] = max(W_MIN, (1 - rl_eta) * old_dw + rl_eta * current_score)
-                # Update R
-                old_rw = curr_r_w[rname]
-                curr_r_w[rname] = max(W_MIN, (1 - rl_eta) * old_rw + rl_eta * current_score)
 
+            # 每次都更新权重 (标准 EMA 指数移动平均更新)
+            if PAIRING_MODE == "paired" and ALLOWED_PAIRS and selected_pair_idx != -1:
+                old_w = curr_pair_w[selected_pair_idx]
+                curr_pair_w[selected_pair_idx] = max(W_MIN,
+                                                     (1 - reaction_factor) * old_w + reaction_factor * current_score)
+            else:
+                old_dw = curr_d_w[dname]
+                curr_d_w[dname] = max(W_MIN, (1 - reaction_factor) * old_dw + reaction_factor * current_score)
+
+                old_rw = curr_r_w[rname]
+                curr_r_w[rname] = max(W_MIN, (1 - reaction_factor) * old_rw + reaction_factor * current_score)
             # Debug打印 (Optional)
             if it % 50 == 0 and ctx.get("verbose", False):
-                print(
-                    f"\n[RL-CHECK] Iter {it} | State: {current_state_id} (Late={current_total_late:.3f}) | Score={current_score}")
-                # 打印当前状态下前 3 个高权重算子
+                print(f"\n[ALNS-CHECK] Iter {it} | Late={current_total_late:.3f} | Score={current_score}")
+                # 打印当前前 3 个高权重修复算子
                 if PAIRING_MODE != "paired":
                     top_r = sorted(curr_r_w, key=curr_r_w.get, reverse=True)[:3]
-                    print(f"  Top R (State {current_state_id}):", [(k, round(curr_r_w[k], 1)) for k in top_r])
-            # 只要得了20分，强制打印，不管是不是50的倍数
+                    print(f"  Top R Weights:", [(k, round(curr_r_w[k], 1)) for k in top_r])
+
+            # 只要得了20分，强制打印
             if current_score == SIGMA_1 and ctx.get("verbose", False):
-                print(f"\n[RL-CHECK] Iter {it} !!! NEW BEST !!! Score=20.0")
+                print(f"\n[ALNS-CHECK] Iter {it} !!! NEW BEST !!! Score=20.0")
     # 返回前再做一次兜底约束
     best_route, best_b2d = sim.enforce_force_truck_solution(data, best_route, best_b2d)
 
@@ -1784,6 +1739,86 @@ def run_decision_epoch(
             if int(ab_cfg.get("grb_verbose", 0)) >= 1:
                 print(
                     f"[GRB] milp_obj_km={grb_obj_km:.3f} | suffix_cost_units={alns_suffix_cost:.3f} | late_h={alns_suffix_late:.3f}")
+    elif planner == "FSTSP":
+        import fstsp_solver
+
+        # 1. 专门为 FSTSP 独立构造所需的数据集 (解决 df_sub 报错)
+        rows_fstsp = []
+
+        # 提取起点 (卡车当前位置)
+        nd_start = data_next.nodes[start_idx_for_alns]
+        rows_fstsp.append({
+            "NODE_ID": start_idx_for_alns, "NODE_TYPE": "truck_pos",
+            "ORIG_X": float(nd_start.get('x', 0)), "ORIG_Y": float(nd_start.get('y', 0)),
+            "DUE_TIME": 1e9, "EFFECTIVE_DUE": 1e9
+        })
+
+        # 提取终点 (中心仓库)
+        nd_depot = data_next.nodes[data_next.central_idx]
+        rows_fstsp.append({
+            "NODE_ID": data_next.central_idx, "NODE_TYPE": "central",
+            "ORIG_X": float(nd_depot.get('x', 0)), "ORIG_Y": float(nd_depot.get('y', 0)),
+            "DUE_TIME": 1e9, "EFFECTIVE_DUE": 1e9
+        })
+
+        # 提取需要服务的客户
+        for c in allowed_customers:
+            if str(data_next.nodes[c].get('node_type', '')).lower() == 'customer':
+                nd_c = data_next.nodes[c]
+                rows_fstsp.append({
+                    "NODE_ID": int(c), "NODE_TYPE": "customer",
+                    "ORIG_X": float(nd_c.get('x', 0.0)), "ORIG_Y": float(nd_c.get('y', 0.0)),
+                    "DUE_TIME": float(nd_c.get('due_time', 0.0)),
+                    "EFFECTIVE_DUE": float(nd_c.get('effective_due', nd_c.get('due_time', 0.0)))
+                })
+
+        df_sub_fstsp = pd.DataFrame(rows_fstsp)
+
+        # 2. 调用 FSTSP 求解器
+        res = fstsp_solver.solve_fstsp_return_from_df(
+            df_sub_fstsp,  # 用刚刚生成的 df_sub_fstsp
+            E_roundtrip_km=float(ab_cfg.get("E_roundtrip_km", 10.0)),
+            truck_speed_kmh=float(ab_cfg.get("truck_speed_kmh", 30.0)),
+            truck_road_factor=float(ab_cfg.get("truck_road_factor", 1.5)),
+            drone_speed_kmh=float(ab_cfg.get("drone_speed_kmh", 60.0)),
+            alpha=float(ab_cfg.get("alpha_drone", 0.3)),
+            lambda_late=float(ab_cfg.get("lambda_late", 50.0)),
+            time_limit=float(ab_cfg.get("grb_time_limit", 1800.0)),  # 给 FSTSP 充足时间
+            mip_gap=float(ab_cfg.get("grb_mip_gap", 0.0)),
+            unit_per_km=float(ab_cfg.get("unit_per_km", 5.0)),
+            start_node=int(start_idx_for_alns),
+            start_time_h=float(decision_time),
+            verbose=int(ab_cfg.get("grb_verbose", 0)),
+        )
+
+        solver_val = res.get("runtime_sec", 0.0)
+
+        # 3. 结果回填与系统口径评估
+        alpha = float(ab_cfg.get("alpha_drone", 0.3))
+        lam = float(ab_cfg.get("lambda_late", 50.0))
+
+        if int(res.get("sol_count", 0)) > 0 and len(res.get("route", [])) > 0:
+            route_next = list(res["route"])
+            b2d_next = {int(b): [int(c) for c in cs] for b, cs in (res.get("drone_assign") or {}).items()}
+
+            # 使用系统统一的评估函数算出 alns_suffix_cost 和 alns_suffix_late
+            (alns_suffix_cost, _, _, _, _, alns_suffix_late, _) = sim.evaluate_truck_drone_with_time(
+                data_next,
+                list(route_next),
+                {b: list(cs) for b, cs in (b2d_next or {}).items()},
+                start_time=decision_time,
+                arrival_prefix=arrival_prefix,
+                alpha_drone=alpha,
+                lambda_late=lam,
+                truck_speed=sim.TRUCK_SPEED_UNITS,
+                drone_speed=sim.DRONE_SPEED_UNITS
+            )
+        else:
+            # Gurobi 在规定时间内没找到解，安全回退
+            route_next = list(init_route) if init_route is not None else []
+            b2d_next = {b: list(cs) for b, cs in (base_to_drone_next or {}).items()}
+            alns_suffix_cost = pre_suffix_cost
+            alns_suffix_late = pre_suffix_late
     elif planner in ("GREEDY", "G1"):
         # -----------------------
         # Greedy / Preplan 基线：不做任何迭代优化
@@ -1929,7 +1964,9 @@ def run_decision_epoch(
     full_route_next = sim.cover_uncovered_by_truck_suffix(
         data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), unserved_customers=unserved_all, verbose=verbose
     )
-
+    # ==================== [新增：全系统出租车模式清理 (主干)] ====================
+    full_route_next = ops.sync_route_bases(data_next, full_route_next, full_b2d_next, {"visited_bases": visited_bases})
+    # =============================================================================
     # 12. 全系统排程 (Full Schedule)
     full_arrival_next, full_total_time_next, _ = sim.compute_truck_schedule(
         data_next, full_route_next, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
@@ -2049,6 +2086,10 @@ def run_decision_epoch(
             full_route_next = sim.cover_uncovered_by_truck_suffix(
                 data_next, full_route_next, full_b2d_next, prefix_len=len(prefix_route), unserved_customers=unserved_all, verbose=verbose
             )
+            # ==================== [新增：全系统出租车模式清理 (回滚)] ====================
+            full_route_next = ops.sync_route_bases(data_next, full_route_next, full_b2d_next,
+                                                   {"visited_bases": visited_bases})
+            # =============================================================================
             full_arrival_next, full_total_time_next, _ = sim.compute_truck_schedule(
                 data_next, full_route_next, start_time=0.0, speed=sim.TRUCK_SPEED_UNITS
             )

@@ -2,7 +2,7 @@
 import random
 import copy
 import simulation as sim
-import operators as ops
+import operatorsnew as ops
 
 
 def vns_truck_drone(data, base_to_drone_customers, max_iter=200, alpha_drone=0.3,
