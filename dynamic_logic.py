@@ -1692,6 +1692,7 @@ def run_decision_epoch(
             mip_gap=float(ab_cfg.get("grb_mip_gap", 0.05)),
             allowed_bases=allowed_bases_grb,
             visited_bases_for_drone=visited_bases_grb,  # 新增参数
+            arrival_prefix=arrival_prefix,
             allow_depot_as_base=False,
             force_truck_customers=ft,
             verbose=int(ab_cfg.get("grb_verbose", 0)),

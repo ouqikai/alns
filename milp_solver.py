@@ -61,6 +61,7 @@ def solve_milp_return_from_df(
         unit_per_km: float,
         allowed_bases: Optional[Set[int]] = None,
         visited_bases_for_drone: Optional[Set[int]] = None,  # <--- 必须补上这个参数
+        arrival_prefix: Optional[Dict[int, float]] = None,
         force_truck_customers: Optional[Set[int]] = None,
         allow_depot_as_base: bool = True,
         verbose: int = 0,
@@ -190,12 +191,15 @@ def solve_milp_return_from_df(
     # max_due = max(nodes[c]["due"] for c in customers) if customers else 0.0
     # M_time = (nV * max_dT_km / truck_speed_kmh) + max_due + 10.0
 
-    # 修改后：
+    # 修改后：动态计算安全上限
     max_due = max(nodes[c]["due"] for c in customers) if customers else 0.0
-    # 诊断打印原 M 值
-    original_M = (nV * max_dT_km / truck_speed_kmh) + max_due + 10.0
-    # 暴力增大 M (例如 10000)，防止 leakage
-    M_time = 100000.0
+
+    # 极端最差情况：卡车跑完所有节点 + 每个节点都要等无人机飞极限距离
+    max_truck_travel_time = nV * (max_dT_km / truck_speed_kmh)
+    max_drone_wait_time = nV * (E_roundtrip_km / drone_speed_kmh)
+
+    # 当前起点时间 + 极端行驶时间 + 极端等待时间 + 安全缓冲
+    M_time = float(start_time_h) + max_truck_travel_time + max_drone_wait_time + max_due + 100.0
     # ---------- 建模 ----------
     m = gp.Model("static_truck_drone_milp")
     m.Params.OutputFlag = 1 if int(verbose) else 0
@@ -270,11 +274,12 @@ def solve_milp_return_from_df(
             if b != depot and b not in visited_bases_for_drone:
                 m.addConstr(y[b, c] <= u[b], name=f"base_visit_if_drone_{b}_{c}")
 
-        # 2. 对 visited bases: 锁定时间 T[b] = start_time (即刻发射)
+        # 2. 对 visited bases: 锁定时间 T[b] = 真实的到达时间 (而非 start_time_h)
         for b in visited_bases_for_drone:
             # 注意：如果该基站不在 V 中 (df_sub 没加)，这里会报错；但 dynamic_logic 已修复 df_sub
             if b in T:
-                m.addConstr(T[b] == float(start_time_h), name=f"time_fix_visited_{b}")
+                actual_arr = float(arrival_prefix.get(b, start_time_h)) if arrival_prefix else float(start_time_h)
+                m.addConstr(T[b] == actual_arr, name=f"time_fix_visited_{b}")
 
     # ---------- 强制卡车客户（新增） ----------
     if force_truck_customers:

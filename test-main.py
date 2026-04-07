@@ -1263,19 +1263,19 @@ def main():
         # (25,  r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\nodes_25_seed2023_20260129_164341_promise.csv",
         #       r"D:\代码\ALNS+DL\exp\datasets\25_data\2023\events_25_seed2023_20260129_164341.csv"),
         #
-        # (50,  r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\nodes_50_seed2023_20260129_174717_promise.csv",
-        #       r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\events_50_seed2023_20260129_174717.csv"),
+        (50,  r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\nodes_50_seed2023_20260129_174717_promise.csv",
+              r"D:\代码\ALNS+DL\exp\datasets\50_data\2023\events_50_seed2023_20260129_174717.csv"),
 
-        (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.1\nodes_100_seed2023_rho0.1_promise.csv",
-         r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.1\events_100_seed2023_rho0.1.csv"),
-        (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.2\nodes_100_seed2023_rho0.2_promise.csv",
-         r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.2\events_100_seed2023_rho0.2.csv"),
-        (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.3\nodes_100_seed2023_rho0.3_promise.csv",
-         r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.3\events_100_seed2023_rho0.3.csv"),
-        (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.5\nodes_100_seed2023_rho0.5_promise.csv",
-         r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.5\events_100_seed2023_rho0.5.csv"),
-        (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.8\nodes_100_seed2023_rho0.8_promise.csv",
-         r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.8\events_100_seed2023_rho0.8.csv"),
+        # (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.1\nodes_100_seed2023_rho0.1_promise.csv",
+        #  r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.1\events_100_seed2023_rho0.1.csv"),
+        # (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.2\nodes_100_seed2023_rho0.2_promise.csv",
+        #  r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.2\events_100_seed2023_rho0.2.csv"),
+        # (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.3\nodes_100_seed2023_rho0.3_promise.csv",
+        #  r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.3\events_100_seed2023_rho0.3.csv"),
+        # (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.5\nodes_100_seed2023_rho0.5_promise.csv",
+        #  r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.5\events_100_seed2023_rho0.5.csv"),
+        # (100, r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.8\nodes_100_seed2023_rho0.8_promise.csv",
+        #  r"D:\代码\ALNS+DL\exp\suc-dif data-dif config\datasets_sensitivity\rho_0.8\events_100_seed2023_rho0.8.csv"),
         # (200, r"D:\代码\ALNS+DL\exp\runs\nodes_200_seed2023_20260309_140841_promise.csv",
         #  r"D:\代码\ALNS+DL\exp\runs\events_200_seed2023_20260309_140841.csv")
     ]
@@ -1293,7 +1293,8 @@ def main():
     TRUCK_ROAD_FACTOR = 1.5
     sim.set_simulation_params(road_factor=TRUCK_ROAD_FACTOR)
     perturbation_times = []
-    SEEDS_TO_RUN = [2025]  # 5 个种子取平均
+    # SEEDS_TO_RUN = [2021, 2022, 2023, 2024, 2025]
+    SEEDS_TO_RUN = [2023]  # 5 个种子取平均
     # ================= [核心：对比组切换开关] =================
     # 只需要修改这个变量："model" (框架对比) 或 "algo" (算法对比)
     SUITE_LEVEL = "single_test"
@@ -1309,10 +1310,12 @@ def main():
         # 目的：证明你的 ALNS 算法比传统的 GA、VNS、贪心算得更好、更快
         # TARGET_METHODS = ["Alns", "Greedy", "GA", "VNS"]
         TARGET_METHODS = ["Alns", "Greedy", "GA", "VNS", "Gurobi"]
+        # TARGET_METHODS = ["Alns", "Gurobi"]
         suite_prefix = "algo_compare"
 
     else:
         TARGET_METHODS = ["Alns"]
+        # TARGET_METHODS = ["Gurobi"]
         suite_prefix = "single_test"
     # ==========================================================
 

@@ -790,7 +790,8 @@ def _predict_tau_ref(
             tau_ref[int(nid)] = start + t_one
             avail[j] = start + t_round
 
-    return tau_ref
+    # 把 arrive_time 一并返回，用来判断基站是未来还是历史
+    return tau_ref, arrive_time
 
 def _in_cover(x: float, y: float, bx: float, by: float, r_units: float) -> bool:
     return math.hypot(x - bx, y - by) <= r_units + 1e-9
@@ -894,7 +895,7 @@ def generate_events_csv(
 
     # Predictor(): 计算 τ_i^ref
     customers_xy = [(int(c["NODE_ID"]), float(c["X"]), float(c["Y"])) for c in customers]
-    tau_ref = _predict_tau_ref(
+    tau_ref, arrive_time = _predict_tau_ref(
         (central[0], central[1]),
         customers_xy,
         base_points=base_points,
@@ -1099,8 +1100,20 @@ def generate_events_csv(
 
         for nid, ox, oy, home, has_other in take_cross:
             evt_class = "CROSS_DB"
-            others = [p for p in base_points if p[2] != home]
-            bx, by, _ = rng.choice(others)
+
+            # 【核心修复】：只挑选预测到达时间晚于当前决策时刻 t_k 的基站
+            future_others = [
+                p for p in base_points
+                if p[2] != home and arrive_time.get(p[2], 0.0) > float(t_k)
+            ]
+
+            if future_others:
+                bx, by, _ = rng.choice(future_others)
+            else:
+                # 兜底：如果没有未来基站，强制降级为同基站内扰动 (IN_DB)
+                evt_class = "IN_DB"
+                bx, by, _ = next(p for p in base_points if p[2] == home)
+
             nx, ny = _sample_uniform_in_disk(rng, bx, by, r_db_units)
             events.append({"EVENT_ID": event_id, "EVENT_TIME": float(t_k), "NODE_ID": nid,
                            "NEW_X": float(nx), "NEW_Y": float(ny), "EVENT_CLASS": evt_class,
@@ -1216,94 +1229,42 @@ def generate_nodes_and_events(
         json.dump(events_meta, _f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
-    # # 默认：生成 25 客户、5 个 seed 的离线 nodes.csv + events.csv
+    # 默认：生成 25 客户、5 个 seed 的离线 nodes.csv + events.csv
     # seed_list = [2023]
-    # # seed_list = [2021, 2022, 2023, 2024, 2025]
-    # n_customers = 100
-    #
-    # # 事件参数（按论文实验统一）
-    # rho_rel = 0.2
-    # n_per_dec = 25
-    # # 手动指定决策点（小时），可不等间隔；例如 [1, 2] 或 [0.5, 1.5, 3]
-    # # decision_times = [1, 2]
-    # # decision_times = [1, 2, 3]
+    seed_list = [2021, 2022, 2023, 2024, 2025]
+    n_customers = 25
+
+    # 事件参数（按论文实验统一）
+    rho_rel = 0.2
+    n_per_dec = 25
+    # 手动指定决策点（小时），可不等间隔；例如 [1, 2] 或 [0.5, 1.5, 3]
+    decision_times = [1, 2]
+    # decision_times = [1, 2, 3]
     # decision_times = [1, 2, 3, 4, 5, 6]
-    # # decision_times = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    # # 注意：如果 decision_times 非空，则生成 events 时将忽略 n_per_dec 推导 K
-    # delta_look_h = 0.25
-    # class_probs = {"IN_DB": 0.5, "CROSS_DB": 0.3, "OUT_DB": 0.2}
-    # include_central_as_base = True
-    #
-    # for s in seed_list:
-    #     cfg = GenConfig(
-    #         n_customers=n_customers,visual_range=150.0,
-    #         drone_roundtrip_km=10.0,
-    #         truck_road_factor=1.5,
-    #         seed=int(s), base_count_override={25: 3,
-    #             50: 6,
-    #             100: 8, 200: 12},
-    #     )
-    #     now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    #     out_nodes = f"nodes_{cfg.n_customers}_seed{cfg.seed}_{now}.csv"
-    #     out_events = f"events_{cfg.n_customers}_seed{cfg.seed}_{now}.csv"
-    #     generate_nodes_and_events(
-    #         cfg, out_nodes, out_events,
-    #         rho_rel=rho_rel,
-    #         n_per_dec=n_per_dec,
-    #         decision_times=decision_times,
-    #         delta_look_h=delta_look_h,
-    #         class_probs=class_probs,
-    #         include_central_as_base=include_central_as_base,
-    #     )
-    # 控制变量：固定规模 100，固定种子 2023
-    fixed_scale = 100
-    seed_list = [2023]
-
-    # 【核心自变量】：测试不同的扰动比例（10%, 30%, 50%, 80%）
-    rho_list = [0.1, 0.2, 0.3, 0.5, 0.8]
-
-    # 全局不变的事件参数
-    decision_times = [1, 2, 3, 4, 5, 6]
-    delta_look_h = 6
-    class_probs = {"IN_DB": 0.6, "CROSS_DB": 0.2, "OUT_DB": 0.2}
+    # decision_times = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    # 注意：如果 decision_times 非空，则生成 events 时将忽略 n_per_dec 推导 K
+    delta_look_h = 0.25
+    class_probs = {"IN_DB": 0.5, "CROSS_DB": 0.3, "OUT_DB": 0.2}
     include_central_as_base = True
 
-    # 专门建一个存放敏感性数据的文件夹，避免和主实验数据混淆
-    base_dir = "datasets_sensitivity"
-    os.makedirs(base_dir, exist_ok=True)
-
-    print(f"🚀 开始批量生成【敏感性分析】基准数据集...")
-
-    for rho in rho_list:
-        # 为每个扰动率建一个子文件夹
-        rho_dir = os.path.join(base_dir, f"rho_{rho}")
-        os.makedirs(rho_dir, exist_ok=True)
-
-        for s in seed_list:
-            # 严格对应你表格里 N=100 的物理配置
-            cfg = GenConfig(
-                n_customers=fixed_scale,
-                visual_range=150.0,
-                drone_roundtrip_km=10.0,
-                truck_road_factor=1.5,
-                seed=int(s),
-                base_count_override={100: 8},
-            )
-
-            # 文件名带上 rho，彻底防止混淆
-            out_nodes = os.path.join(rho_dir, f"nodes_{cfg.n_customers}_seed{cfg.seed}_rho{rho}.csv")
-            out_events = os.path.join(rho_dir, f"events_{cfg.n_customers}_seed{cfg.seed}_rho{rho}.csv")
-
-            print(f"\n[GENERATING] 扰动率: {rho * 100}% | 规模: {fixed_scale} | 种子: {s}")
-
-            generate_nodes_and_events(
-                cfg, out_nodes, out_events,
-                rho_rel=rho,  # 动态传入当前的扰动率
-                n_per_dec=25,
-                decision_times=decision_times,
-                delta_look_h=delta_look_h,
-                class_probs=class_probs,
-                include_central_as_base=include_central_as_base,
-            )
-
-    print("\n🎉 敏感性分析数据集生成完毕！请在 datasets_sensitivity/ 目录下查看。")
+    for s in seed_list:
+        cfg = GenConfig(
+            n_customers=n_customers,visual_range=150.0,
+            drone_roundtrip_km=10.0,
+            truck_road_factor=1.5,
+            seed=int(s), base_count_override={25: 3,
+                50: 6,
+                100: 8, 200: 12},
+        )
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_nodes = f"nodes_{cfg.n_customers}_seed{cfg.seed}_{now}.csv"
+        out_events = f"events_{cfg.n_customers}_seed{cfg.seed}_{now}.csv"
+        generate_nodes_and_events(
+            cfg, out_nodes, out_events,
+            rho_rel=rho_rel,
+            n_per_dec=n_per_dec,
+            decision_times=decision_times,
+            delta_look_h=delta_look_h,
+            class_probs=class_probs,
+            include_central_as_base=include_central_as_base,
+        )
